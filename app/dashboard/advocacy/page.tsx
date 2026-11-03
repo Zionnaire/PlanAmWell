@@ -141,8 +141,8 @@ export default function AdvocacyListPage() {
                 <Tr>
                   <Th>Title</Th>
                   <Th>Author</Th>
-                  <Th>Category</Th>
-                  <Th>Views</Th>
+                  <Th className="hidden md:table-cell">Category</Th>
+                  <Th className="hidden lg:table-cell">Views</Th>
                   <Th>Status</Th>
                   <Th className="text-right">Actions</Th>
                 </Tr>
@@ -152,8 +152,8 @@ export default function AdvocacyListPage() {
                   <Tr key={a._id}>
                     <Td className="font-semibold text-on-surface">{a.title}</Td>
                     <Td className="text-on-surface-variant">{a.author?.name || a.partner || "—"}</Td>
-                    <Td>{a.category ? <Badge tone="info">{a.category}</Badge> : <span className="text-on-surface-variant">—</span>}</Td>
-                    <Td className="text-on-surface-variant">{a.views ?? 0}</Td>
+                    <Td className="hidden md:table-cell">{a.category ? <Badge tone="info">{a.category}</Badge> : <span className="text-on-surface-variant">—</span>}</Td>
+                    <Td className="hidden text-on-surface-variant lg:table-cell">{a.views ?? 0}</Td>
                     <Td>
                       <Badge tone={STATUS_TONE[a.status] || "neutral"} className="capitalize">
                         {a.status || "draft"}

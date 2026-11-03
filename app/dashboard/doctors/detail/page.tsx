@@ -2,7 +2,7 @@
 
 import { Suspense, useEffect, useState } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
-import { getAllDoctors, updateDoctorStatusService } from "../../../services/AdminService";
+import { getDoctorByIdService, updateDoctorStatusService } from "../../../services/AdminService";
 import { Card } from "../../../components/ui/Card";
 import { Badge } from "../../../components/ui/Badge";
 import { Button } from "../../../components/ui/Button";
@@ -59,8 +59,7 @@ function DoctorDetail() {
 
     const fetchDoctor = async () => {
       try {
-        const data = await getAllDoctors();
-        const doc = data.find((d: any) => d._id === id);
+        const doc = await getDoctorByIdService(id);
         if (doc) {
           setDoctor({
             ...doc,
@@ -72,7 +71,7 @@ function DoctorDetail() {
           });
         }
       } catch (err: any) {
-        setError(err.message || "Failed to fetch doctor");
+        setError(err.response?.data?.message || err.message || "Failed to fetch doctor");
       } finally {
         setLoading(false);
       }

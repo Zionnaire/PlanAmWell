@@ -1,13 +1,25 @@
 "use client";
 
-import { useState } from "react";
-import axios from "axios";
+import { useEffect, useState } from "react";
 import { useTheme } from "../../context/ThemeContext";
 import { useRouter } from "next/navigation";
+import { registerAdminService, isAdminAuthenticated } from "../../services/AdminService";
 
+// Creating a new admin account now requires an already-authenticated admin
+// (the backend route is no longer public — see adminRoutes.ts) — this page
+// itself used to be reachable by anyone, letting them self-register full
+// admin access with no invite or approval step. The real gate is on the
+// backend; this redirect is just so a signed-out visitor gets sent to login
+// instead of hitting a confusing failure after filling out the form.
 export default function AdminRegisterPage() {
   const { colors } = useTheme();
   const router = useRouter();
+
+  useEffect(() => {
+    if (!isAdminAuthenticated()) {
+      router.replace("/auth/login");
+    }
+  }, [router]);
 
   const [form, setForm] = useState({
     firstName: "",
@@ -18,6 +30,7 @@ export default function AdminRegisterPage() {
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [success, setSuccess] = useState(false);
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setForm({ ...form, [e.target.name]: e.target.value });
@@ -29,15 +42,9 @@ export default function AdminRegisterPage() {
     setLoading(true);
 
     try {
-      const { data } = await axios.post(
-        `${process.env.NEXT_PUBLIC_API_URL}/admin/adminRegister`,
-        form
-      );
-
-      localStorage.setItem("token", data?.data?.token || "");
-      if (data?.data?.refreshToken) localStorage.setItem("refreshToken", data.data.refreshToken);
-
-      router.replace("/dashboard");
+      await registerAdminService(form);
+      setSuccess(true);
+      setForm({ firstName: "", lastName: "", email: "", password: "" });
     } catch (err: any) {
       setError(err.response?.data?.message || "Registration failed");
     } finally {
@@ -68,8 +75,14 @@ export default function AdminRegisterPage() {
         >
           <h2 className="text-3xl font-bold text-center">Create Admin Account</h2>
           <p className="text-center text-sm text-gray-500">
-            Fill in your details to get started
+            Add a new administrator to Plan Am Well
           </p>
+
+          {success && (
+            <div className="p-3 bg-green-50 border border-green-200 text-green-700 rounded text-sm">
+              Admin account created successfully.
+            </div>
+          )}
 
           {error && (
             <div className="p-3 bg-red-50 border border-red-200 text-red-600 rounded text-sm">
@@ -123,13 +136,12 @@ export default function AdminRegisterPage() {
               loading ? "opacity-70 cursor-not-allowed bg-pink-600" : "bg-pink-600 hover:bg-pink-700"
             }`}
           >
-            {loading ? "Registering..." : "Register"}
+            {loading ? "Creating..." : "Create Admin"}
           </button>
 
           <p className="text-center text-sm text-gray-500">
-            Already have an account?{" "}
-            <a href="/auth/login" className="text-pink-600 hover:underline font-medium">
-              Login
+            <a href="/dashboard" className="text-pink-600 hover:underline font-medium">
+              &larr; Back to Dashboard
             </a>
           </p>
         </form>

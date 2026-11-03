@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Search, RefreshCw, BarChart2 } from "lucide-react";
-import { getAllOrdersService } from "../../services/AdminService";
+import { getAllOrdersService, verifyOrderPaymentService } from "../../services/AdminService";
 import { orderStatusTone, statusLabel } from "../../lib/orderStatus";
 import { Card } from "../../components/ui/Card";
 import { Input } from "../../components/ui/Input";
@@ -30,6 +30,7 @@ export default function OrdersPage() {
     try {
       const data = await getAllOrdersService();
       setOrders(data);
+      verifyPendingOrders(data);
     } catch (err) {
       console.error("Failed to fetch orders", err);
     } finally {
@@ -37,8 +38,21 @@ export default function OrdersPage() {
     }
   };
 
+  const verifyPendingOrders = async (list: any[]) => {
+    const pending = list.filter((o) => o.paymentStatus === "pending");
+    if (pending.length === 0) return;
+    await Promise.allSettled(pending.map((o) => verifyOrderPaymentService(o._id)));
+    try {
+      const refreshed = await getAllOrdersService();
+      setOrders(refreshed);
+    } catch (err) {
+      console.error("Failed to refresh orders after verify", err);
+    }
+  };
+
   useEffect(() => {
     fetchOrders();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const filtered = useMemo(() => {
@@ -130,10 +144,10 @@ export default function OrdersPage() {
                 <Tr>
                   <Th>Order #</Th>
                   <Th>Customer</Th>
-                  <Th>Date</Th>
+                  <Th className="hidden md:table-cell">Date</Th>
                   <Th className="text-right">Total</Th>
                   <Th>Payment</Th>
-                  <Th>Delivery</Th>
+                  <Th className="hidden lg:table-cell">Delivery</Th>
                 </Tr>
               </Thead>
               <Tbody>
@@ -150,7 +164,7 @@ export default function OrdersPage() {
                       <p className="font-semibold text-on-surface">{order.shippingAddress?.name ?? "—"}</p>
                       <p className="text-xs text-on-surface-variant">{order.shippingAddress?.phone ?? ""}</p>
                     </Td>
-                    <Td className="text-on-surface-variant">
+                    <Td className="hidden text-on-surface-variant md:table-cell">
                       {order.createdAt ? new Date(order.createdAt).toLocaleDateString() : "—"}
                     </Td>
                     <Td className="text-right font-semibold text-on-surface">
@@ -159,7 +173,7 @@ export default function OrdersPage() {
                     <Td>
                       <Badge tone={orderStatusTone(order.paymentStatus)}>{statusLabel(order.paymentStatus)}</Badge>
                     </Td>
-                    <Td>
+                    <Td className="hidden lg:table-cell">
                       <Badge tone={orderStatusTone(order.deliveryStatus)}>{statusLabel(order.deliveryStatus)}</Badge>
                     </Td>
                   </Tr>

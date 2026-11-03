@@ -3,7 +3,7 @@
 import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { ArrowLeft, RefreshCw, Package, MapPin, CreditCard, Truck } from "lucide-react";
-import { getAllOrdersService, refreshOrderDeliveryService } from "../../../services/AdminService";
+import { getOrderByIdService, refreshOrderDeliveryService, verifyOrderPaymentService } from "../../../services/AdminService";
 import { orderStatusTone, statusLabel } from "../../../lib/orderStatus";
 import { Card } from "../../../components/ui/Card";
 import { Badge } from "../../../components/ui/Badge";
@@ -45,9 +45,18 @@ function OrderDetail() {
     const load = async () => {
       setLoading(true);
       try {
-        const all = await getAllOrdersService();
-        const found = all.find((o: any) => o._id === orderId);
-        setOrder(found ?? null);
+        const found = await getOrderByIdService(orderId);
+        setOrder(found);
+        // Only ever showed whatever a partner webhook last wrote — re-check
+        // with the partner directly instead of waiting on it indefinitely.
+        if (found?.paymentStatus === "pending") {
+          verifyOrderPaymentService(orderId)
+            .then(() => getOrderByIdService(orderId))
+            .then((updated) => {
+              if (updated) setOrder(updated);
+            })
+            .catch((err) => console.error("Failed to verify order payment", err));
+        }
       } catch (err) {
         console.error("Failed to load order", err);
       } finally {

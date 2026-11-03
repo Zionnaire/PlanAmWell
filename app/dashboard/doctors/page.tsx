@@ -119,8 +119,8 @@ export default function DoctorsPage() {
               <Thead>
                 <Tr>
                   <Th>Doctor</Th>
-                  <Th>Specialization</Th>
-                  <Th>Joined</Th>
+                  <Th className="hidden md:table-cell">Specialization</Th>
+                  <Th className="hidden lg:table-cell">Joined</Th>
                   <Th>Status</Th>
                 </Tr>
               </Thead>
@@ -140,8 +140,8 @@ export default function DoctorsPage() {
                         </div>
                       </div>
                     </Td>
-                    <Td className="text-on-surface-variant">{specializationText(d.specialization)}</Td>
-                    <Td className="text-on-surface-variant">
+                    <Td className="hidden text-on-surface-variant md:table-cell">{specializationText(d.specialization)}</Td>
+                    <Td className="hidden text-on-surface-variant lg:table-cell">
                       {d.createdAt ? new Date(d.createdAt).toLocaleDateString() : "—"}
                     </Td>
                     <Td>

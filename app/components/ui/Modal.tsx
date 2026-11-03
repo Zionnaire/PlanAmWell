@@ -21,7 +21,7 @@ export function Modal({ open, onClose, title, children, className = "" }: ModalP
         onClick={onClose}
       />
       <div
-        className={`relative w-full max-w-lg rounded-3xl border border-white/50 bg-white/70 p-8 shadow-2xl backdrop-blur-xl ${className}`}
+        className={`relative w-full max-w-lg rounded-3xl border border-outline-variant/50 bg-surface-container-lowest/90 p-8 shadow-2xl backdrop-blur-xl ${className}`}
       >
         <button
           onClick={onClose}

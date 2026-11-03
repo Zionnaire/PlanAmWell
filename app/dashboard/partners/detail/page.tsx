@@ -14,7 +14,6 @@ import {
   ArrowLeft,
   Package,
   DollarSign,
-  TrendingUp,
   AlertCircle,
 } from "lucide-react";
 import { Card } from "../../../components/ui/Card";
@@ -64,7 +63,7 @@ function PartnerDetails() {
   const [orders, setOrders] = useState<Order[]>([]);
   const [loadingOrders, setLoadingOrders] = useState(false);
   const [ordersError, setOrdersError] = useState<string | null>(null);
-  const [selectedTab, setSelectedTab] = useState<"overview" | "orders" | "commission">("overview");
+  const [selectedTab, setSelectedTab] = useState<"overview" | "orders">("overview");
 
   const partnerId = searchParams.get("id");
 
@@ -203,14 +202,6 @@ function PartnerDetails() {
             >
               Orders
             </button>
-            <button
-              onClick={() => setSelectedTab("commission")}
-              className={`border-b-2 pb-3 text-sm font-semibold transition-colors ${
-                selectedTab === "commission" ? "border-primary text-primary" : "border-transparent text-on-surface-variant hover:text-on-surface"
-              }`}
-            >
-              Commission Report
-            </button>
           </>
         )}
       </div>
@@ -305,16 +296,6 @@ function PartnerDetails() {
               </Tbody>
             </Table>
           )}
-        </Card>
-      )}
-
-      {selectedTab === "commission" && (
-        <Card>
-          <h2 className="mb-4 text-lg font-semibold text-on-surface">Commission Report</h2>
-          <div className="rounded-2xl border-2 border-dashed border-surface-variant py-10 text-center">
-            <TrendingUp size={40} className="mx-auto mb-4 text-outline" />
-            <p className="text-on-surface-variant">Reconciliation data for delivered orders will appear here shortly.</p>
-          </div>
         </Card>
       )}
     </div>

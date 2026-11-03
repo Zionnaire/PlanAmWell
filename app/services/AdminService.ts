@@ -70,14 +70,16 @@ adminApi.interceptors.response.use(
   }
 );
 // ==================== ADMIN AUTH SERVICES ====================
+// Creating a new admin now requires an already-authenticated admin's own
+// token (the backend route is no longer public) — routed through adminApi
+// so that token is actually attached, instead of a bare unauthenticated call.
 export const registerAdminService = async (adminData: {
   firstName: string;
   lastName: string;
   email: string;
   password: string;
 }) => {
-  const { data } = await axios.post(`${BASE_URL}/admin/adminRegister`, adminData);
-  if (data.success && data.data.token) localStorage.setItem("token", data.data.token);
+  const { data } = await adminApi.post(`/admin/adminRegister`, adminData);
   return data?.data;
 };
 
@@ -101,6 +103,15 @@ export const updateDoctorStatusService = async (doctorId: string, status: string
 export const getAllDoctors = async () => {
   const { data } = await adminApi.get("/admin/doctors");
   return data?.data || [];
+};
+
+// The doctor detail page used to fetch the entire doctor list just to find
+// one record by id. The public `/doctors/:id` route already exists and
+// returns non-approved doctors too when called with an admin token, so use
+// that instead.
+export const getDoctorByIdService = async (doctorId: string) => {
+  const { data } = await adminApi.get(`/doctors/${doctorId}`);
+  return data?.data;
 };
 
 export const getAllUsers = async () => {
@@ -234,9 +245,26 @@ export const getAllOrdersService = async () => {
   return data?.data || [];
 };
 
+export const getOrderByIdService = async (orderId: string) => {
+  const { data } = await adminApi.get(`/admin/orders/${orderId}`);
+  return data?.data ?? null;
+};
+
 export const refreshOrderDeliveryService = async (orderId: string) => {
   const { data } = await adminApi.get(`/admin/orders/${orderId}/delivery`);
   return data;
+};
+
+// Orders only ever showed whatever Order.paymentStatus a partner webhook last
+// wrote — if that webhook was delayed or never arrived, a paid order sat
+// showing "pending" here indefinitely. Actively re-check with the partner
+// instead, same fallback the web and mobile order pages already have.
+export const verifyOrderPaymentService = async (orderId: string) => {
+  const { data } = await adminApi.get(`/payment/by-order/${orderId}`);
+  const paymentReference = data?.data?.paymentReference;
+  if (!paymentReference) return null;
+  const verifyRes = await adminApi.post(`/payment/verify`, { paymentReference });
+  return verifyRes.data;
 };
 
 export const getCommissionReportService = async (year: number, month: number) => {
@@ -372,6 +400,7 @@ export default {
   getPendingDoctors,
   updateDoctorStatusService,
   getAllDoctors,
+  getDoctorByIdService,
   getAllUsers,
   getAUser,
   getAllAdmins,

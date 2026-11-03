@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Settings as SettingsIcon } from "lucide-react";
+import Link from "next/link";
+import { Settings as SettingsIcon, UserPlus } from "lucide-react";
 import { getPlatformSettingsService, updatePlatformSettingsService } from "../../services/AdminService";
 import { Card } from "../../components/ui/Card";
 import { Input } from "../../components/ui/Input";
@@ -75,6 +76,18 @@ export default function SettingsPage() {
             </Button>
           </>
         )}
+      </Card>
+
+      <Card className="max-w-md space-y-3">
+        <h3 className="text-sm font-semibold text-on-surface">Admin Team</h3>
+        <p className="text-xs text-on-surface-variant">
+          Add another administrator. They&apos;ll get full access to this dashboard, so only invite people you trust.
+        </p>
+        <Link href="/auth/register">
+          <Button variant="outline">
+            <UserPlus size={16} /> Create Admin Account
+          </Button>
+        </Link>
       </Card>
     </div>
   );

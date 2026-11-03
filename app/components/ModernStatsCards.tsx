@@ -1,7 +1,9 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { Users, Stethoscope, Clock, DollarSign } from "lucide-react";
 import { useCombinedGrowth } from "../hooks/useCombinedGrowth";
+import { getAllOrdersService } from "../services/AdminService";
 import { StatCard } from "./ui/StatCard";
 import { Card } from "./ui/Card";
 
@@ -14,6 +16,54 @@ type StatItem = {
 
 export default function ModernStatsCards() {
   const { growthData, loading, error } = useCombinedGrowth(1); // last month
+
+  // The backend's combinedGrowth endpoint has no concept of revenue, so this
+  // card used to just render `$0` forever. Orders already carry a reliable
+  // `total`/`paymentStatus`, and the Orders page sums those client-side for
+  // its own "Total Revenue" stat — mirror that here, scoped to the current
+  // calendar month, since there's no dedicated revenue aggregate endpoint yet.
+  const [revenue, setRevenue] = useState<{ current: number; growth: number }>({ current: 0, growth: 0 });
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadRevenue = async () => {
+      try {
+        const orders = await getAllOrdersService();
+        const paidOrders = (orders || []).filter((o: any) => o.paymentStatus === "paid");
+
+        const now = new Date();
+        const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+        const previousMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+
+        const currentMonthRevenue = paidOrders
+          .filter((o: any) => o.createdAt && new Date(o.createdAt) >= currentMonthStart)
+          .reduce((sum: number, o: any) => sum + Number(o.total ?? 0), 0);
+
+        const previousMonthRevenue = paidOrders
+          .filter(
+            (o: any) =>
+              o.createdAt && new Date(o.createdAt) >= previousMonthStart && new Date(o.createdAt) < currentMonthStart
+          )
+          .reduce((sum: number, o: any) => sum + Number(o.total ?? 0), 0);
+
+        const growth = previousMonthRevenue
+          ? ((currentMonthRevenue - previousMonthRevenue) / previousMonthRevenue) * 100
+          : currentMonthRevenue
+          ? 100
+          : 0;
+
+        if (!cancelled) setRevenue({ current: currentMonthRevenue, growth });
+      } catch (err) {
+        console.error("Failed to fetch orders for Monthly Revenue stat", err);
+      }
+    };
+
+    loadRevenue();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   if (loading) {
     return (
@@ -48,8 +98,8 @@ export default function ModernStatsCards() {
     },
     {
       title: "Monthly Revenue",
-      value: `$${(growthData.monthlyRevenue || 0).toLocaleString()}`,
-      growth: Number(growthData.revenueGrowthPercent) || 0,
+      value: `₦${revenue.current.toLocaleString()}`,
+      growth: Number(revenue.growth.toFixed(2)) || 0,
       icon: DollarSign,
     },
   ];

@@ -102,8 +102,8 @@ export default function PartnersListPage() {
               <Thead>
                 <Tr>
                   <Th>Partner</Th>
-                  <Th>Type</Th>
-                  <Th>Contact</Th>
+                  <Th className="hidden md:table-cell">Type</Th>
+                  <Th className="hidden lg:table-cell">Contact</Th>
                   <Th>Status</Th>
                 </Tr>
               </Thead>
@@ -129,12 +129,12 @@ export default function PartnersListPage() {
                         </div>
                       </div>
                     </Td>
-                    <Td>
+                    <Td className="hidden md:table-cell">
                       <Badge tone="neutral" dot={false} className="capitalize">
                         {partner.partnerType}
                       </Badge>
                     </Td>
-                    <Td className="text-on-surface-variant">{partner.email || partner.phone || "—"}</Td>
+                    <Td className="hidden text-on-surface-variant lg:table-cell">{partner.email || partner.phone || "—"}</Td>
                     <Td>
                       <Badge tone={partner.isActive ? "success" : "error"}>
                         {partner.isActive ? "Active" : "Inactive"}

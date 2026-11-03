@@ -100,8 +100,8 @@ export default function UsersPage() {
                 <Tr>
                   <Th>User</Th>
                   <Th>Email</Th>
-                  <Th>Phone</Th>
-                  <Th>Joined</Th>
+                  <Th className="hidden md:table-cell">Phone</Th>
+                  <Th className="hidden lg:table-cell">Joined</Th>
                   <Th>Status</Th>
                 </Tr>
               </Thead>
@@ -119,8 +119,8 @@ export default function UsersPage() {
                       </div>
                     </Td>
                     <Td className="text-on-surface-variant">{u.email || "—"}</Td>
-                    <Td className="text-on-surface-variant">{u.phone || "—"}</Td>
-                    <Td className="text-on-surface-variant">
+                    <Td className="hidden text-on-surface-variant md:table-cell">{u.phone || "—"}</Td>
+                    <Td className="hidden text-on-surface-variant lg:table-cell">
                       {u.createdAt ? new Date(u.createdAt).toLocaleDateString() : "—"}
                     </Td>
                     <Td>

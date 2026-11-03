@@ -181,16 +181,10 @@ export default function AdminLoginPage() {
             </div>
           </div>
 
-          <div className="flex justify-between items-center mt-6 mb-8 text-sm">
+          <div className="flex justify-center items-center mt-6 mb-8 text-sm">
             <Link href="/auth/forgot-password" className="text-pink-600 hover:underline">
               Forgot Password?
             </Link>
-            <div className="flex items-center gap-1">
-                <span className="opacity-60">New here?</span>
-                <Link href="/auth/register" className="text-pink-600 hover:underline font-medium">
-                Create Account
-                </Link>
-            </div>
           </div>
 
           <button
