@@ -2,7 +2,7 @@
 
 **A reproductive and sexual health platform for Nigeria: AI health assistant, doctor appointments with in-app video calls, health records, medication reminders, and a health e-commerce store, across mobile, web, and admin.**
 
-🔗 **Website:** https://planamwell.com
+🔗 **Website:** [https://planamwell.com](https://plan-am-well-web.onrender.com/)
 
 <!-- ![Mobile](docs/mobile.png) ![Web](docs/web.png) ![Admin](docs/admin.png) -->
 
