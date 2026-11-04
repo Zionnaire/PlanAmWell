@@ -1,0 +1,97 @@
+import mongoose, { Document, Schema, Types } from "mongoose";
+import { v4 as uuidv4 } from "uuid";
+
+export interface IOrderItem {
+  productId: string; // local reference to Product
+  name?: string;
+  sku?: string;
+  qty: number;
+  price: number;
+  dosage?: string; // optional, for API
+  specialInstructions?: string; // optional, for API
+}
+
+export interface IOrder extends Document {
+  _id: Types.ObjectId;
+  partnerId?: Types.ObjectId;
+  orderNumber: string;
+  sessionId?: string;
+  userId?: string;
+  partnerOrderId?: string;
+  partnerOrderCode?: string;
+  isThirdPartyOrder?: boolean;
+  platform?: string;
+  items: IOrderItem[];
+  subtotal: number;
+  shippingFee: number;
+  total: number;
+  paymentStatus: "pending" | "paid" | "failed" | "refunded";
+  deliveryStatus?: "pending" | "processing" | "shipped" | "delivered" | "cancelled" | "failed";
+  deliveryMethod?: string;
+  shippingAddress?: {
+    name?: string;
+    phone?: string;
+    addressLine?: string;
+    city?: string;
+    state?: string;
+    lga?: string;
+  };
+  discreetPackaging?: boolean;
+  createdAt?: Date;
+  updatedAt?: Date;
+}
+
+const OrderItemSchema = new Schema<IOrderItem>(
+  {
+    productId: { type: String, ref: "Product", required: true },
+    name: String,
+    sku: String,
+    qty: { type: Number, required: true },
+    price: { type: Number, required: true },
+    dosage: String,
+    specialInstructions: String,
+
+  },
+  { _id: false }
+);
+
+const OrderSchema = new Schema<IOrder>(
+  {
+    orderNumber: { type: String, required: true, unique: true, default: uuidv4 },
+    sessionId: String,
+    userId: { type: String, ref: "User" },
+    partnerOrderId: { type: String },         // partner system order ID
+    isThirdPartyOrder: { type: Boolean, default: false },
+    platform: { type: String, default: "PlanAmWell" },
+    partnerOrderCode: { type: String }, 
+    items: { type: [OrderItemSchema], required: true },
+    subtotal: { type: Number, required: true },
+    shippingFee: { type: Number, default: 0 },
+    total: { type: Number, required: true },
+    paymentStatus: {
+      type: String,
+      enum: ["pending", "paid", "failed", "refunded"],
+      default: "pending",
+    },
+    deliveryStatus: {
+      type: String,
+  enum: ["pending", "processing", "shipped", "delivered", "cancelled", "failed"],
+      default: "pending",
+    },
+    deliveryMethod: String,
+    shippingAddress: {
+      name: String,
+      phone: String,
+      addressLine: String,
+      city: String,
+      state: String,
+      lga: String,
+    },
+    partnerId: { type: Schema.Types.ObjectId, ref: "Partner", required: false }, // optional for third-party orders
+
+    discreetPackaging: { type: Boolean, default: false },
+  },
+  { timestamps: true }
+);
+
+export const Order = mongoose.model<IOrder>("Order", OrderSchema);

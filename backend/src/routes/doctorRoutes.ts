@@ -1,0 +1,69 @@
+import { Router } from "express";
+import {
+  getDoctors,
+  getDoctor,
+  getDoctorCategories,
+  createDoctor,
+  updateDoctor,
+  getMyDoctorProfile,
+  updateDoctorAvailability,
+  updateDoctorPushToken,
+  deleteDoctor,
+  completeDoctorProfile,
+} from "../controllers/doctorController";
+import { verifyToken, authorize, guestAuth } from "../middleware/auth";
+import multer from "multer";
+const storage = multer.memoryStorage();
+
+const fileFilter = (req: any, file: any, cb: any) => {
+  // Accept images only
+  if (file.mimetype.startsWith("image/")) {
+    cb(null, true);
+  } else {
+    cb(new Error("Only image files are allowed!"), false);
+  }
+};
+const upload = multer({
+  storage,
+  fileFilter,
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB limit
+  },
+});
+
+
+const doctorRouter = Router();
+
+/**
+ * PUBLIC — doctor self-registration
+ * Status defaults to 'submitted'
+ */
+doctorRouter.post("/", upload.single("doctorImage"), createDoctor);
+
+/**
+ * PUBLIC — get all approved doctors
+ */
+doctorRouter.get("/", getDoctors);
+
+doctorRouter.get("/doctorCategories", getDoctorCategories )
+
+doctorRouter.get("/profile", guestAuth, verifyToken, getMyDoctorProfile);
+
+doctorRouter.put("/availability", guestAuth, verifyToken, authorize("Doctor"), updateDoctorAvailability);
+
+doctorRouter.put("/update-push-token", guestAuth, verifyToken, authorize("Doctor"), updateDoctorPushToken);
+doctorRouter.post("/complete-profile", guestAuth, verifyToken, authorize("Doctor"), completeDoctorProfile);
+
+
+// NOW the /:id routes
+// Viewing a single approved doctor's profile is exactly as public as the
+// list endpoint above — guestAuth alone still lets an authenticated Admin
+// preview a non-approved doctor (getDoctor checks req.auth?.role itself),
+// it just no longer hard-requires a real, non-anonymous account to browse.
+doctorRouter.get("/:id", guestAuth, getDoctor);
+doctorRouter.put("/:id", guestAuth, verifyToken, authorize("Doctor", "Admin"), upload.single("doctorImage"), updateDoctor);
+doctorRouter.delete("/:id", guestAuth, verifyToken, authorize("Admin"), deleteDoctor);
+
+
+
+export default doctorRouter;

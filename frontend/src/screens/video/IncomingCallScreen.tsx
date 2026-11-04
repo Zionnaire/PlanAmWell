@@ -1,0 +1,423 @@
+// screens/video/IncomingCallScreen.tsx - Fixed TypeScript types
+import React, { useEffect, useState, useRef } from 'react';
+import {
+  View,
+  Text,
+  StyleSheet,
+  TouchableOpacity,
+  Image,
+  Animated,
+  Vibration,
+  Platform,
+  StatusBar,
+  ActivityIndicator,
+} from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { Ionicons } from '@expo/vector-icons';
+import { LinearGradient } from 'expo-linear-gradient';
+import { Audio } from 'expo-av';
+import { StackScreenProps } from '@react-navigation/stack';
+import { AppStackParamList } from '../../types/App';
+import { respondToVideoCall } from '../../services/Chat';
+import { useVideoCall } from '../../hooks/useVideoCall';
+import socketService from '../../services/socketService';
+import Toast  from 'react-native-toast-message';
+
+// ✅ Fixed: Use proper StackScreenProps type
+type IncomingCallScreenProps = StackScreenProps<AppStackParamList, 'IncomingCall'>;
+
+export default function IncomingCallScreen({ route, navigation }: IncomingCallScreenProps) {
+  const {
+    appointmentId,
+    callerName = 'Unknown Caller',
+    callerImage,
+    callerType,
+    channelName,
+    conversationId,
+    videoRequestId,
+    callType = 'video',
+    autoAction,
+  } = route.params;
+  const isVoiceCall = callType === 'audio';
+
+  const { declineCall } = useVideoCall();
+
+  const [pulseAnim] = useState(new Animated.Value(1));
+  const [responding, setResponding] = useState(false);
+  const soundRef = useRef<Audio.Sound | null>(null);
+  const vibrationIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    // Opened via a notification action button (e.g. iOS lock-screen
+    // Accept/Decline) — run it immediately, skip the ringing UI entirely.
+    if (autoAction === 'decline') {
+      handleDecline();
+      return;
+    }
+    if (autoAction === 'accept') {
+      handleAccept();
+      return;
+    }
+
+    // Start ringtone and vibration
+    startRingtone();
+    startVibration();
+
+    // Pulse animation
+    Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulseAnim, {
+          toValue: 1.15,
+          duration: 1000,
+          useNativeDriver: true,
+        }),
+        Animated.timing(pulseAnim, {
+          toValue: 1,
+          duration: 1000,
+          useNativeDriver: true,
+        }),
+      ])
+    ).start();
+
+    // Auto-dismiss after 60 seconds
+    const timeout = setTimeout(() => {
+      handleDecline();
+    }, 60000);
+
+    // The caller cancelling mid-ring, or this same user answering on
+    // another session (WhatsApp-style "answered elsewhere"), both arrive as
+    // call-cancelled — dismiss immediately instead of ringing the full 60s.
+    const socket = socketService.getSocket();
+    const handleCancelled = (data: { appointmentId: string }) => {
+      if (data.appointmentId !== appointmentId) return;
+      cleanup();
+      clearTimeout(timeout);
+      if (navigation.canGoBack()) {
+        navigation.goBack();
+      } else {
+        navigation.navigate('HomeScreen');
+      }
+    };
+    socket?.on('call-cancelled', handleCancelled);
+
+    return () => {
+      clearTimeout(timeout);
+      socket?.off('call-cancelled', handleCancelled);
+      cleanup();
+    };
+  }, []);
+
+  const startRingtone = async () => {
+    try {
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        staysActiveInBackground: true,
+        playsInSilentModeIOS: true,
+        shouldDuckAndroid: true,
+        playThroughEarpieceAndroid: false,
+      });
+
+      // Bundled locally — the previous implementation depended on three
+      // third-party CDN URLs (mixkit.co, soundjay.com, actions.google.com)
+      // over the network, which is why the screen was appearing with no
+      // sound: those loads were silently failing. A bundled asset has no
+      // network dependency and always loads.
+      const { sound } = await Audio.Sound.createAsync(
+        require('../../assets/sounds/incoming_call.wav'),
+        { isLooping: true, volume: 1.0, shouldPlay: true }
+      );
+      soundRef.current = sound;
+      console.log('🔔 Ringtone playing (bundled asset)');
+    } catch (error) {
+      console.error('❌ Failed to play ringtone:', error);
+    }
+  };
+
+  const startVibration = () => {
+    const pattern = [0, 400, 200, 400, 200, 400];
+    
+    if (Platform.OS === 'android') {
+      Vibration.vibrate(pattern, true);
+    } else {
+      vibrationIntervalRef.current = setInterval(() => {
+        Vibration.vibrate(400);
+      }, 1000);
+    }
+  };
+
+  const cleanup = async () => {
+    if (soundRef.current) {
+      try {
+        await soundRef.current.stopAsync();
+        await soundRef.current.unloadAsync();
+        soundRef.current = null;
+      } catch (error) {
+        console.error('❌ Failed to stop ringtone:', error);
+      }
+    }
+
+    Vibration.cancel();
+    if (vibrationIntervalRef.current) {
+      clearInterval(vibrationIntervalRef.current);
+      vibrationIntervalRef.current = null;
+    }
+  };
+
+  const handleAccept = async () => {
+    await cleanup();
+
+    setResponding(true);
+    try {
+      // If there's a video request, confirm acceptance with backend
+      if (conversationId && videoRequestId) {
+        try {
+          await respondToVideoCall(conversationId, videoRequestId, true);
+          Toast.show({ type: "success", text1: "Call Accepted" });
+        } catch (error) {
+          console.warn('⚠️ Failed to respond to video request:', error);
+          // Continue anyway - let them join the call
+        }
+      }
+
+      // Navigate to video call screen
+      navigation.replace('VideoCallScreen', {
+        appointmentId,
+        name: callerName,
+        role: callerType === 'Doctor' ? 'user' : 'doctor',
+        callType,
+      });
+    } finally {
+      setResponding(false);
+    }
+  };
+
+  const handleDecline = async () => {
+    await cleanup();
+
+    try {
+      if (conversationId && videoRequestId) {
+        // Chat-based request: notify the requester via the video-call-response event
+        await respondToVideoCall(conversationId, videoRequestId, false);
+      } else {
+        // Appointment-based call: reset callStatus and emit call-cancelled to initiator
+        await declineCall(appointmentId);
+      }
+    } catch (error) {
+      console.warn('⚠️ Failed to send decline notification:', error);
+    }
+
+    if (navigation.canGoBack()) {
+      navigation.goBack();
+    } else {
+      navigation.navigate('HomeScreen');
+    }
+  };
+
+  return (
+    <SafeAreaView style={styles.container}>
+      <StatusBar barStyle="light-content" backgroundColor="#1a1a2e" />
+      
+      <LinearGradient
+        colors={['#1a1a2e', '#16213e', '#0f3460']}
+        style={styles.gradient}
+      >
+        {/* Header */}
+        <View style={styles.header}>
+          <Text style={styles.headerText}>{isVoiceCall ? 'Incoming Voice Call' : 'Incoming Video Call'}</Text>
+        </View>
+
+        {/* Caller Info */}
+        <View style={styles.callerContainer}>
+          <Animated.View
+            style={[
+              styles.avatarContainer,
+              {
+                transform: [{ scale: pulseAnim }],
+              },
+            ]}
+          >
+            {callerImage ? (
+              <Image source={{ uri: callerImage }} style={styles.avatar} />
+            ) : (
+              <View style={[styles.avatar, styles.avatarPlaceholder]}>
+                <Ionicons name="person" size={80} color="#fff" />
+              </View>
+            )}
+          </Animated.View>
+
+          <Text style={styles.callerName}>{callerName}</Text>
+          <Text style={styles.callerType}>
+            {callerType === 'Doctor' ? 'Doctor' : 'Patient'}
+          </Text>
+
+          <View style={styles.callingContainer}>
+            <View style={styles.pulsingDot} />
+            <Text style={styles.callingText}>Incoming call...</Text>
+          </View>
+        </View>
+
+        {/* Call Actions */}
+        <View style={styles.actionsContainer}>
+          {/* Decline Button */}
+          <TouchableOpacity
+            style={styles.actionButton}
+            onPress={handleDecline}
+            activeOpacity={0.7}
+          >
+            <LinearGradient
+              colors={['#ef4444', '#dc2626']}
+              style={styles.actionButtonGradient}
+            >
+              <Ionicons
+                name="call"
+                size={32}
+                color="#fff"
+                style={{ transform: [{ rotate: '135deg' }] }}
+              />
+            </LinearGradient>
+            <Text style={styles.actionLabel}>Decline</Text>
+          </TouchableOpacity>
+
+          {/* Accept Button */}
+          <TouchableOpacity
+            style={[styles.actionButton, responding && styles.actionButtonDisabled]}
+            onPress={handleAccept}
+            activeOpacity={0.7}
+            disabled={responding}
+          >
+            <LinearGradient
+              colors={['#10b981', '#059669']}
+              style={styles.actionButtonGradient}
+            >
+              {responding ? (
+                <ActivityIndicator color="#fff" size="small" />
+              ) : (
+                <Ionicons name={isVoiceCall ? 'call' : 'videocam'} size={32} color="#fff" />
+              )}
+            </LinearGradient>
+            <Text style={styles.actionLabel}>{responding ? 'Joining...' : 'Accept'}</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* Quick Info */}
+        <View style={styles.infoContainer}>
+          <Ionicons name="lock-closed" size={16} color="#94a3b8" />
+          <Text style={styles.infoText}>End-to-end encrypted</Text>
+        </View>
+      </LinearGradient>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#1a1a2e',
+  },
+  gradient: {
+    flex: 1,
+  },
+  header: {
+    alignItems: 'center',
+    paddingTop: 20,
+    paddingBottom: 40,
+  },
+  headerText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '500',
+    opacity: 0.8,
+  },
+  callerContainer: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 20,
+  },
+  avatarContainer: {
+    marginBottom: 24,
+  },
+  avatar: {
+    width: 140,
+    height: 140,
+    borderRadius: 70,
+    borderWidth: 4,
+    borderColor: 'rgba(255, 255, 255, 0.2)',
+  },
+  avatarPlaceholder: {
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  callerName: {
+    color: '#fff',
+    fontSize: 32,
+    fontWeight: '700',
+    marginBottom: 8,
+    textAlign: 'center',
+  },
+  callerType: {
+    color: '#94a3b8',
+    fontSize: 16,
+    fontWeight: '500',
+    marginBottom: 24,
+  },
+  callingContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  pulsingDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#10b981',
+  },
+  callingText: {
+    color: '#10b981',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  actionsContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    paddingHorizontal: 60,
+    paddingVertical: 40,
+  },
+  actionButton: {
+    alignItems: 'center',
+  },
+  actionButtonGradient: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    justifyContent: 'center',
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 8,
+  },
+  actionLabel: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+    marginTop: 12,
+  },
+  actionButtonDisabled: {
+    opacity: 0.6,
+  },
+  infoContainer: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
+    gap: 8,
+    paddingBottom: 40,
+  },
+  infoText: {
+    color: '#94a3b8',
+    fontSize: 12,
+    fontWeight: '500',
+  },
+});

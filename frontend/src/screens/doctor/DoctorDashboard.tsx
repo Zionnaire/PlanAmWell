@@ -1,0 +1,1408 @@
+import React, { useState, useEffect, useMemo } from "react";
+import {
+  View,
+  Text,
+  StyleSheet,
+  ScrollView,
+  TouchableOpacity,
+  Image,
+  Modal,
+  ActivityIndicator,
+  RefreshControl,
+  TextInput,
+  KeyboardAvoidingView,
+  Platform,
+} from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
+import { Ionicons } from "@expo/vector-icons";
+import Toast from "react-native-toast-message";
+import { LinearGradient } from "expo-linear-gradient";
+
+import { useAuth } from "../../hooks/useAuth";
+import { IDoctor, IAppointment } from "../../types/backendType";
+import { getDoctorAppointments, updateAppointment } from "../../services/Appointment";
+import { getUserConversations } from "../../services/Chat";
+import { updateDoctorAvailabilityService, fetchMyDoctorProfile } from "../../services/Doctor";
+import { useTheme } from "../../context/ThemeContext";
+import { useNotifications } from "../../context/notificatonContext"; // ✅ Import the context
+import DoctorBottomBar from "../../components/common/DoctorBottomBar";
+import { Alert } from "react-native";
+import AppointmentModal from "../../components/appointment/AppointmentModal";
+import { useVideoCall } from "../../hooks/useVideoCall";
+import { useAppointmentCallStatus } from "../../hooks/useAppointmentCallStatus";
+import { notificationService } from "../../services/notification";
+import DoctorViewSwitcher from "../../components/doctor/DoctorViewSwitcher";
+import { RADIUS, SPACING, SHADOW } from "../../theme/layout";
+
+const formatTime = (date: Date) =>
+  date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+const DAYS_OF_WEEK = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+
+export default function DoctorDashboardScreen({ navigation }: any) {
+  const { colors } = useTheme();
+  const { user, loading: authLoading } = useAuth();
+  const doctorUser = user && (user as any).status === "approved" ? (user as IDoctor) : null;
+
+  // ✅ Use notification context instead of manual fetching
+  const { unreadCount, refresh: refreshNotifications } = useNotifications();
+
+  const [appointments, setAppointments] = useState<IAppointment[]>([]);
+  const [appointmentsLoading, setAppointmentsLoading] = useState(false);
+  const [availabilityLoading, setAvailabilityLoading] = useState(false);
+  const [selectedDate, setSelectedDate] = useState(new Date().getDate());
+  const [showModal, setShowModal] = useState(false);
+  const [selectedAppointment, setSelectedAppointment] = useState<IAppointment | null>(null);
+  const [availability, setAvailability] = useState<Record<string, any>>({});
+  const [refreshing, setRefreshing] = useState(false);
+  const [messagesCount, setMessagesCount] = useState(0);
+  const [showAvailabilityModal, setShowAvailabilityModal] = useState(false);
+  const [checkingCallStatus, setCheckingCallStatus] = useState(false);
+  // Guards accept/reject against a rapid double-tap firing the same network
+  // call twice — holds the appointment id currently in flight, or null.
+  const [processingId, setProcessingId] = useState<string | null>(null);
+
+ const { getCallStatus } = useVideoCall();
+
+
+  const {
+    getEffectiveStatus,
+    refreshCallStatus,
+  } = useAppointmentCallStatus();
+
+  useEffect(() => {
+    if (authLoading) return;
+    if (!doctorUser) {
+      navigation.replace("HomeScreen");
+      return;
+    }
+    
+    fetchAppointments();
+    fetchAvailability();
+    fetchMessagesCount();
+  }, [authLoading, doctorUser]);
+
+  // messagesCount was previously a dead useState(0) — never updated after
+  // init, so the "Messages" stat card (and the bottom bar badge) always
+  // showed 0 regardless of actual unread messages. Sum unread counts across
+  // conversations the same way ConversationsListScreen already does per row.
+  const fetchMessagesCount = async () => {
+    try {
+      const conversations = await getUserConversations();
+      const total = conversations.reduce((sum, c) => sum + (c.unreadCount?.doctor ?? 0), 0);
+      setMessagesCount(total);
+    } catch (error) {
+      console.error("[DoctorDashboard] Failed to load messages count:", error);
+    }
+  };
+
+  const handleViewSwitch = (view: 'dashboard' | 'home') => {
+  if (view === 'home') {
+    // Navigate to general HomeScreen
+    navigation.navigate('HomeScreen' as never);
+  }
+  // If view === 'dashboard', we're already here, so do nothing
+};
+
+  const fetchAvailability = async () => {
+    try {
+      setAvailabilityLoading(true);
+      const doctorProfile = await fetchMyDoctorProfile();
+      if (doctorProfile) {
+        const defaultAvailability = DAYS_OF_WEEK.reduce((acc, day) => ({
+          ...acc,
+          [day]: { available: false, from: "09:00", to: "17:00" }
+        }), {});
+        
+        setAvailability({ ...defaultAvailability, ...doctorProfile.availability });
+      }
+    } catch (error: any) {
+      Toast.show({ type: "error", text1: "Failed to load availability", text2: error.message });
+    } finally {
+      setAvailabilityLoading(false);
+    }
+  };
+
+  const fetchAppointments = async () => {
+    if (!doctorUser?._id) return;
+    try {
+      setAppointmentsLoading(true);
+      const data = await getDoctorAppointments();
+      if (!Array.isArray(data)) return setAppointments([]);
+
+      const appointmentsWithDates = data
+        .map(appt => ({
+          ...appt,
+          scheduledAt: new Date(appt.scheduledAt),
+          patientName:
+            appt.patientSnapshot?.name ||
+            `${(appt.userId as any)?.firstName || ""} ${(appt.userId as any)?.lastName || ""}`.trim() ||
+            "Anonymous",
+        }))
+        .sort((a, b) => a.scheduledAt.getTime() - b.scheduledAt.getTime());
+
+      setAppointments(appointmentsWithDates);
+    } catch (error: any) {
+      Toast.show({ type: "error", text1: "Failed to load appointments", text2: error.message });
+    } finally {
+      setAppointmentsLoading(false);
+    }
+  };
+
+  const onRefresh = async () => {
+    setRefreshing(true);
+    await Promise.all([
+      fetchAppointments(),
+      fetchMessagesCount(),
+      refreshNotifications() // ✅ Refresh notifications from context
+    ]);
+    setRefreshing(false);
+  };
+
+  const getNextAppointment = () => {
+    const now = new Date();
+    const futureConfirmed = appointments
+      .filter(a => a.status === "confirmed" && new Date(a.scheduledAt) >= now)
+      .sort((a, b) => new Date(a.scheduledAt).getTime() - new Date(b.scheduledAt).getTime());
+    return futureConfirmed[0] || null;
+  };
+
+
+
+  const handleAccept = async (appt: IAppointment) => {
+    if (processingId) return; // ignore re-entrant tap while a call is in flight
+    setProcessingId(appt._id!);
+    try {
+      let userId: string | undefined;
+      if (appt.userId && typeof appt.userId === "object" && appt.userId !== null && ("_id" in (appt.userId as any))) {
+        userId = (appt.userId as any)._id as string;
+      } else {
+        userId = appt.userId as string | undefined;
+      }
+
+      await updateAppointment(appt._id!, { status: "confirmed" });
+
+      Toast.show({ type: "success", text1: "Appointment confirmed" });
+      fetchAppointments();
+      setShowModal(false);
+    } catch (error: any) {
+      console.error('[Update Error] Failed to confirm appointment:', error.response?.data || error);
+      Toast.show({
+        type: "error",
+        text1: "Failed to confirm",
+        text2: error.response?.data?.message || error.message
+      });
+    } finally {
+      setProcessingId(null);
+    }
+  };
+
+  const handleReject = async (appt: IAppointment) => {
+    if (processingId) return; // ignore re-entrant tap while a call is in flight
+    setProcessingId(appt._id!);
+    try {
+      await updateAppointment(appt._id!, { status: "rejected" });
+
+      Toast.show({ type: "success", text1: "Appointment rejected" });
+      fetchAppointments();
+      setShowModal(false);
+    } catch (error: any) {
+      console.error('[Update Error] Failed to reject appointment:', error.response?.data || error);
+      Toast.show({
+        type: "error",
+        text1: "Failed to reject",
+        text2: error.response?.data?.message || error.message
+      });
+    } finally {
+      setProcessingId(null);
+    }
+  };
+
+  const openAppointmentModal = (appt: IAppointment) => {
+    setSelectedAppointment(appt);
+    setShowModal(true);
+  };
+
+  const toggleAvailability = (day: string) => {
+    setAvailability(prev => ({
+      ...prev,
+      [day]: {
+        ...prev[day],
+        available: !prev[day]?.available
+      }
+    }));
+  };
+
+  const updateTime = (day: string, field: 'from' | 'to', value: string) => {
+    setAvailability(prev => ({
+      ...prev,
+      [day]: {
+        ...prev[day],
+        [field]: value
+      }
+    }));
+  };
+
+  const handleSaveAvailability = async () => {
+    try {
+      setAvailabilityLoading(true);
+      const updatedDoctor = await updateDoctorAvailabilityService(availability);
+      if (updatedDoctor) {
+        setAvailability(updatedDoctor.availability || {});
+        Toast.show({ type: "success", text1: "Availability updated successfully" });
+        setShowAvailabilityModal(false);
+      }
+    } catch (error: any) {
+      Toast.show({ type: "error", text1: "Failed to update availability", text2: error.message });
+    } finally {
+      setAvailabilityLoading(false);
+    }
+  };
+
+  const setAllDaysAvailability = (available: boolean) => {
+    const updated: Record<string, any> = {};
+    DAYS_OF_WEEK.forEach(day => {
+      updated[day] = { ...availability[day], available };
+    });
+    setAvailability(updated);
+  };
+
+  const setWeekdaysOnly = () => {
+    const updated: Record<string, any> = {};
+    DAYS_OF_WEEK.forEach(day => {
+      updated[day] = {
+        ...availability[day],
+        available: !["Saturday", "Sunday"].includes(day),
+      };
+    });
+    setAvailability(updated);
+  };
+
+  const handleJoinCall = async (appointment: IAppointment) => {
+    if (!appointment._id) {
+      Toast.show({
+        type: 'error',
+        text1: 'Error',
+        text2: 'Invalid appointment',
+      });
+      return;
+    }
+
+    const navigateToCall = (callType: 'audio' | 'video' = 'video') => {
+      const navParams = {
+        appointmentId: appointment._id,
+        name: appointment.patientSnapshot?.name || 'Patient',
+        patientId: appointment.userId,
+        role: 'doctor' as const,
+        autoJoin: true,
+        fromAppointmentList: true,
+        callType,
+      };
+
+      try {
+        const parentNavigator = navigation.getParent();
+        if (parentNavigator && typeof parentNavigator.navigate === 'function') {
+          console.log('✅ Navigating via Parent Stack');
+          parentNavigator.navigate('VideoCallScreen', navParams);
+          return;
+        }
+      } catch (parentError) {
+        console.warn('⚠️ Parent navigation failed:', parentError);
+      }
+
+      try {
+        console.log('✅ Navigating via Current Stack');
+        navigation.navigate('VideoCallScreen', navParams);
+      } catch (currentError) {
+        console.error('❌ Current navigation failed:', currentError);
+        Toast.show({
+          type: 'error',
+          text1: 'Navigation Error',
+          text2: 'Unable to open video call. Please try again.',
+        });
+      }
+    };
+
+    try {
+      setCheckingCallStatus(true);
+
+      const response = await getCallStatus(appointment._id);
+
+      console.log('📞 Call status response:', {
+        success: response?.success,
+        hasData: !!response?.data,
+        isActive: response?.data?.isActive,
+        callStatus: response?.data?.callStatus,
+      });
+
+      if (!response || !response.success) {
+        throw new Error(response?.message || 'Failed to check call status');
+      }
+
+      const { isActive, callStatus, callType, canJoin, minutesUntilCanJoin } = response.data;
+
+      if (isActive === true) {
+        console.log('✅ Call is active (status:', callStatus, '), joining...');
+        navigateToCall(callType || 'video');
+      } else if (canJoin === false) {
+        // Backend's generateVideoToken enforces this same 15-minute window —
+        // check it here too so the doctor gets a clear message instead of a
+        // raw 400 from startCall.
+        console.log('⏳ Too early to start call —', minutesUntilCanJoin, 'minute(s) remaining');
+        Alert.alert(
+          'Too Early to Start',
+          minutesUntilCanJoin
+            ? `You can start this call ${minutesUntilCanJoin} minute(s) before the scheduled time.`
+            : 'This call is not available to start yet.',
+          [
+            { text: 'OK', style: 'cancel' },
+            {
+              text: 'View Appointment',
+              onPress: () => openAppointmentModal(appointment),
+            },
+          ]
+        );
+      } else {
+        console.log('ℹ️ Call not active (status:', callStatus, '), showing options...');
+
+        Alert.alert(
+          'Start Video Call?',
+          `This will start the video consultation with ${
+            appointment.patientSnapshot?.name || 'the patient'
+          }.`,
+          [
+            {
+              text: 'Cancel',
+              style: 'cancel',
+            },
+            {
+              text: 'Start Call',
+              onPress: () => {
+                console.log('✅ User chose to start call');
+                navigateToCall();
+              },
+            },
+            {
+              text: 'View Appointment',
+              onPress: () => {
+                console.log('ℹ️ User chose to view appointment');
+                openAppointmentModal(appointment);
+              },
+            },
+          ]
+        );
+      }
+    } catch (error: any) {
+      console.error('❌ Failed to check call status:', error);
+      
+      Alert.alert(
+        'Unable to Check Status',
+        'Would you like to start the call anyway?',
+        [
+          {
+            text: 'Cancel',
+            style: 'cancel',
+          },
+          {
+            text: 'Start Call',
+            onPress: () => {
+              console.log('✅ User chose to start call (fallback)');
+              navigateToCall();
+            },
+          },
+        ]
+      );
+    } finally {
+      setCheckingCallStatus(false);
+    }
+  };
+
+  const getStatusColor = (status: IAppointment["status"]) => {
+    switch (status) {
+      case "confirmed": return colors.success;
+      case "pending": return colors.primary;
+      case "rejected": return colors.error;
+      case "rescheduled": return colors.secondary;
+      case "cancelled":
+      case "completed": return colors.textMuted;
+      default: return colors.textMuted;
+    }
+  };
+
+  const getStatusIcon = (status: IAppointment["status"]): string => {
+    switch (status) {
+      case "confirmed": return "checkmark-circle";
+      case "pending": return "time";
+      case "rejected": return "close-circle";
+      case "rescheduled": return "refresh-circle";
+      case "cancelled": return "close-circle-outline";
+      case "completed": return "checkmark-done-circle";
+      default: return "help-circle";
+    }
+  };
+
+  const getGreeting = () => {
+    const hour = new Date().getHours();
+    if (hour < 12) return "Good Morning";
+    if (hour < 18) return "Good Afternoon";
+    return "Good Evening";
+  };
+
+  const getAvatarUri = () => {
+    if (!doctorUser) return "";
+    // doctorImage is the populated Image document (primary source after upload)
+    const docImg = doctorUser.doctorImage as any;
+    if (docImg?.imageUrl) return docImg.imageUrl;
+    if (docImg?.secure_url) return docImg.secure_url;
+    // Legacy fallback: profileImage string
+    if (typeof doctorUser.profileImage === "string" && doctorUser.profileImage) return doctorUser.profileImage;
+    const profileImg = doctorUser.profileImage as any;
+    if (profileImg?.imageUrl) return profileImg.imageUrl;
+    return `https://ui-avatars.com/api/?name=${encodeURIComponent(`${doctorUser.firstName} ${doctorUser.lastName}`)}&background=D81E5B&color=fff`;
+  };
+
+  const scheduleData = Array.from({ length: 7 }, (_, i) => {
+    const date = new Date();
+    date.setDate(date.getDate() + i);
+    const dayAppointments = appointments.filter(
+      (a) => a.scheduledAt.toDateString() === date.toDateString()
+    );
+    return {
+      date: date.getDate(),
+      day: date.toLocaleDateString("en-US", { weekday: "short" }),
+      appointments: dayAppointments.length,
+      fullDate: date,
+    };
+  });
+
+  const todayAppointmentsCount = useMemo(
+    () => appointments.filter(a => a.scheduledAt.toDateString() === new Date().toDateString()).length,
+    [appointments]
+  );
+
+  const pendingRequestsCount = useMemo(
+    () => appointments.filter(a => a.status === "pending").length,
+    [appointments]
+  );
+
+  const availableDaysCount = useMemo(
+    () => Object.values(availability).filter((d: any) => d?.available).length,
+    [availability]
+  );
+
+  const totalWeeklyHours = useMemo(() => {
+    return Object.values(availability)
+      .filter((d: any) => d?.available)
+      .reduce((sum, d: any) => {
+        if (!d?.from || !d?.to) return sum;
+        const from = new Date(`2000-01-01T${d.from}`);
+        const to = new Date(`2000-01-01T${d.to}`);
+        return sum + (to.getTime() - from.getTime()) / (1000 * 60 * 60);
+      }, 0);
+  }, [availability]);
+
+  const nextAppointment = getNextAppointment();
+
+  const selectedDateAppointments = useMemo(
+    () => appointments
+      .filter(a => a.scheduledAt.getDate() === selectedDate)
+      .sort((a, b) => a.scheduledAt.getTime() - b.scheduledAt.getTime()),
+    [appointments, selectedDate]
+  );
+
+  if (authLoading || appointmentsLoading) {
+    return (
+      <SafeAreaView style={[styles.screen, { backgroundColor: colors.background }]}>
+        <View style={styles.loadingContainer}>
+          <ActivityIndicator size="large" color={colors.primary} />
+          <Text style={[styles.loadingText, { color: colors.textMuted }]}>
+            Loading appointments...
+          </Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  const doctorLastName = doctorUser?.lastName || doctorUser?.firstName || "Doctor";
+  return (
+    <SafeAreaView style={[styles.screen, { backgroundColor: colors.background }]}>
+      <ScrollView
+        contentContainerStyle={styles.scrollContent}
+        showsVerticalScrollIndicator={false}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
+      >
+        {/* Header */}
+      <LinearGradient colors={["#D81E5B20", "#ffffff"]} style={styles.headerGradient}>
+          <View style={styles.headerTop}>
+            <View style={styles.doctorInfo}>
+              <TouchableOpacity onPress={() => navigation.navigate("DoctorProfileScreen", { doctor: doctorUser })}>
+                <Image source={{ uri: getAvatarUri() }} style={styles.avatar} />
+              </TouchableOpacity>
+              <View>
+                <Text style={[styles.greeting, { color: colors.textMuted }]}>{getGreeting()},</Text>
+                <Text style={[styles.doctorName, { color: colors.text }]}>Dr. {doctorLastName}</Text>
+              </View>
+            </View>
+            <TouchableOpacity 
+              onPress={() => navigation.navigate("NotificationsScreen")}
+              style={{ position: 'relative' }}
+            >
+              <Ionicons name="notifications-outline" size={24} color={colors.text} />
+              {unreadCount > 0 && (
+                <View style={styles.notificationBadge}>
+                  <Text style={styles.notificationBadgeText}>
+                    {unreadCount > 9 ? '9+' : unreadCount}
+                  </Text>
+                </View>
+              )}
+            </TouchableOpacity>
+          </View>
+        </LinearGradient>
+
+{/* View Switcher */}
+<DoctorViewSwitcher 
+  currentView="dashboard" 
+  onSwitchView={handleViewSwitch} 
+/>
+
+        {/* Stats Row */}
+        <View style={styles.statsRow}>
+          <TouchableOpacity
+            style={[styles.statItem, { backgroundColor: colors.card }]}
+            onPress={() => navigation.navigate("DoctorAppointment", { filter: "today" })}
+          >
+            <Text style={[styles.statLabel, { color: colors.textMuted }]}>
+              Today's Appointments
+            </Text>
+            <Text style={[styles.statValue, { color: colors.text }]}>
+              {todayAppointmentsCount}
+            </Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.statItem, { backgroundColor: colors.card }]}
+            onPress={() => navigation.navigate("DoctorAppointment", { status: "pending" })}
+          >
+            <Text style={[styles.statLabel, { color: colors.textMuted }]}>
+              Pending Requests
+            </Text>
+            <Text style={[styles.statValue, { color: colors.text }]}>
+              {pendingRequestsCount}
+            </Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.statItem, { backgroundColor: colors.card }]}
+            onPress={() => navigation.navigate("NotificationsScreen")}
+          >
+            <Text style={[styles.statLabel, { color: colors.textMuted }]}>
+              Messages
+            </Text>
+            <Text style={[styles.statValue, { color: colors.text }]}>
+              {messagesCount}
+            </Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* Up Next Section */}
+        <View style={styles.section}>
+          <Text style={[styles.sectionTitle, { color: colors.text }]}>Up Next</Text>
+          {nextAppointment ? (
+            <View style={[styles.upNextCard, { backgroundColor: colors.card }]}>
+              <View style={[styles.upNextAccent, { backgroundColor: colors.primary }]} />
+              <Text style={[styles.upNextTime, { color: colors.primary }]}>
+                {formatTime(nextAppointment.scheduledAt)} - Video Consultation
+              </Text>
+              <Text style={[styles.upNextPatient, { color: colors.text }]}>
+                {nextAppointment.patientSnapshot?.name}
+              </Text>
+              <Text style={[styles.upNextCondition, { color: colors.textMuted }]} numberOfLines={2}>
+                {nextAppointment.reason || "No details provided"}
+              </Text>
+
+              <View style={styles.upNextActions}>
+                <TouchableOpacity 
+                  style={[
+                    styles.joinButton, 
+                    { backgroundColor: colors.primary },
+                    checkingCallStatus && { opacity: 0.7 }
+                  ]} 
+                  onPress={() => handleJoinCall(nextAppointment)}
+                  disabled={checkingCallStatus}
+                >
+                  {checkingCallStatus ? (
+                    <ActivityIndicator size="small" color="#fff" />
+                  ) : (
+                    <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                      <Ionicons name="videocam" size={18} color="#fff" style={{ marginRight: 6 }} />
+                      <Text style={styles.joinButtonText}>Join Call</Text>
+                    </View>
+                  )}
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={[styles.viewDetailsButton, { borderColor: colors.primary }]}
+                  onPress={() => openAppointmentModal(nextAppointment)}
+                >
+                  <Text style={[styles.viewDetailsButtonText, { color: colors.primary }]}>
+                    View Details
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          ) : (
+            <View style={[styles.upNextCard, styles.emptyStateCard, { backgroundColor: colors.card, padding: 20 }]}>
+              <Text style={[styles.emptyText, { color: colors.textMuted }]}>
+                No confirmed appointments scheduled soon.
+              </Text>
+            </View>
+          )}
+        </View>
+
+        {/* Quick Access to Messages */}
+<View style={styles.section}>
+  <View style={styles.sectionHeader}>
+    <Text style={[styles.sectionTitle, { color: colors.text }]}>Quick Access</Text>
+  </View>
+  
+  <TouchableOpacity
+    style={[styles.quickAccessCard, { backgroundColor: colors.card }]}
+    onPress={() => navigation.navigate("ConversationsListScreen")}
+  >
+    <View style={[styles.quickAccessIcon, { backgroundColor: colors.primary + "1A" }]}>
+      <Ionicons name="chatbubbles" size={28} color={colors.primary} />
+    </View>
+    <View style={styles.quickAccessContent}>
+      <Text style={[styles.quickAccessTitle, { color: colors.text }]}>
+        Patient Messages
+      </Text>
+      <Text style={[styles.quickAccessSubtitle, { color: colors.textMuted }]}>
+        Chat with your patients
+      </Text>
+    </View>
+    <Ionicons name="chevron-forward" size={24} color={colors.textMuted} />
+  </TouchableOpacity>
+</View>
+
+        {/* Weekly Availability */}
+        <View style={styles.section}>
+          <View style={styles.sectionHeader}>
+            <Text style={[styles.sectionTitle, { color: colors.text }]}>Weekly Availability</Text>
+            <TouchableOpacity 
+              style={[styles.manageBtn, { backgroundColor: colors.primary }]}
+              onPress={() => setShowAvailabilityModal(true)}
+            >
+              <Ionicons name="calendar" size={16} color="#fff" />
+              <Text style={styles.manageBtnText}>Manage</Text>
+            </TouchableOpacity>
+          </View>
+
+          <LinearGradient 
+            colors={["#4F46E5", "#7C3AED"]} 
+            style={styles.availabilitySummary}
+          >
+            <View style={styles.summaryItem}>
+              <Text style={styles.summaryLabel}>Available Days</Text>
+              <Text style={styles.summaryValue}>{availableDaysCount}</Text>
+            </View>
+            <View style={styles.summaryDivider} />
+            <View style={styles.summaryItem}>
+              <Text style={styles.summaryLabel}>Total Hours</Text>
+              <Text style={styles.summaryValue}>{totalWeeklyHours.toFixed(0)}h</Text>
+            </View>
+          </LinearGradient>
+
+          <View style={styles.daysPreview}>
+            {DAYS_OF_WEEK.map(day => {
+              const dayData = availability[day];
+              const isAvailable = dayData?.available;
+              return (
+                <View key={day} style={[
+                  styles.dayChip,
+                  { backgroundColor: isAvailable ? colors.success : colors.border }
+                ]}>
+                  <Text style={[
+                    styles.dayChipText,
+                    { color: isAvailable ? '#fff' : colors.textMuted }
+                  ]}>
+                    {day.slice(0, 3)}
+                  </Text>
+                </View>
+              );
+            })}
+          </View>
+        </View>
+
+        {/* My Schedule */}
+        <View style={styles.section}>
+          <Text style={[styles.sectionTitle, { color: colors.text }]}>My Schedule</Text>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.scheduleScroll}>
+            {scheduleData.map((item) => {
+              const isSelected = item.date === selectedDate;
+              return (
+                <TouchableOpacity
+                  key={item.date}
+                  style={[
+                    styles.scheduleDate,
+                    { backgroundColor: colors.card },
+                    isSelected && { backgroundColor: colors.primary }
+                  ]}
+                  onPress={() => setSelectedDate(item.date)}
+                >
+                  <Text style={[
+                    styles.dayText,
+                    { color: colors.textMuted },
+                    isSelected && { color: colors.background }
+                  ]}>
+                    {item.day}
+                  </Text>
+                  <Text style={[
+                    styles.dateText,
+                    { color: colors.text },
+                    isSelected && { color: colors.background }
+                  ]}>
+                    {item.date}
+                  </Text>
+                  {item.appointments > 0 && (
+                    <View style={[
+                      styles.appointmentDot,
+                      { backgroundColor: colors.text },
+                      isSelected && { backgroundColor: colors.background }
+                    ]} />
+                  )}
+                </TouchableOpacity>
+              );
+            })}
+          </ScrollView>
+
+          <View style={styles.appointmentList}>
+            {selectedDateAppointments.length === 0 ? (
+              <View style={styles.emptyStateCard}>
+                <Ionicons name="calendar-outline" size={48} color={colors.textMuted} />
+                <Text style={[styles.emptyText, { color: colors.textMuted }]}>
+                  No appointments for this day
+                </Text>
+              </View>
+            ) : (
+              selectedDateAppointments.map((appt) => (
+                <TouchableOpacity 
+                  key={appt._id} 
+                  style={[styles.appointmentCard, { backgroundColor: colors.card }]} 
+                  onPress={() => openAppointmentModal(appt)}
+                >
+                  <View style={styles.appointmentLeft}>
+                    <Text style={[styles.appointmentTime, { color: colors.text }]}>
+                      {formatTime(appt.scheduledAt)}
+                    </Text>
+                  </View>
+                  <View style={styles.appointmentRight}>
+                    <Text style={[styles.appointmentPatient, { color: colors.text }]}>
+                      {appt.patientSnapshot?.name}
+                    </Text>
+                    <Text style={[styles.appointmentType, { color: colors.textMuted }]} numberOfLines={1}>
+                      {appt.reason || appt.status}
+                    </Text>
+                  </View>
+                  <Ionicons 
+                    name={getStatusIcon(appt.status) as any} 
+                    size={24} 
+                    color={getStatusColor(appt.status)} 
+                    style={styles.appointmentIcon} 
+                  />
+                </TouchableOpacity>
+              ))
+            )}
+          </View>
+        </View>
+      </ScrollView>
+
+      {/* Availability Modal */}
+      <Modal visible={showAvailabilityModal} animationType="slide" transparent>
+        <KeyboardAvoidingView
+          behavior={Platform.OS === "ios" ? "padding" : "height"}
+          style={styles.modalOverlay}
+        >
+          <View style={[styles.availabilityModal, { backgroundColor: colors.background }]}>
+            <View style={styles.availabilityModalHeader}>
+              <Text style={[styles.availabilityModalTitle, { color: colors.text }]}>
+                Manage Availability
+              </Text>
+              <TouchableOpacity onPress={() => setShowAvailabilityModal(false)}>
+                <Ionicons name="close-circle" size={28} color={colors.text} />
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView style={styles.availabilityModalContent}>
+              {/* Quick Actions */}
+              <View style={styles.quickActions}>
+                <TouchableOpacity
+                  style={[styles.quickActionBtn, { backgroundColor: colors.card }]}
+                  onPress={() => setAllDaysAvailability(true)}
+                >
+                  <Ionicons name="checkmark-circle-outline" size={16} color={colors.success} />
+                  <Text style={[styles.quickActionText, { color: colors.text }]}>Enable All</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.quickActionBtn, { backgroundColor: colors.card }]}
+                  onPress={() => setWeekdaysOnly()}
+                >
+                  <Ionicons name="calendar-outline" size={16} color={colors.info} />
+                  <Text style={[styles.quickActionText, { color: colors.text }]}>Weekdays Only</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.quickActionBtn, { backgroundColor: colors.card }]}
+                  onPress={() => setAllDaysAvailability(false)}
+                >
+                  <Ionicons name="close-circle-outline" size={16} color={colors.error} />
+                  <Text style={[styles.quickActionText, { color: colors.text }]}>Disable All</Text>
+                </TouchableOpacity>
+              </View>
+
+              {/* Day Cards */}
+              {DAYS_OF_WEEK.map((day) => {
+                const dayData = availability[day] || { available: false, from: "09:00", to: "17:00" };
+                return (
+                  <View key={day} style={[styles.dayCard, {
+                    backgroundColor: colors.card,
+                    borderColor: dayData.available ? colors.success : colors.border
+                  }]}>
+                    <View style={styles.dayCardHeader}>
+                      <View style={styles.dayCardLeft}>
+                        <View style={[styles.dayBadge, {
+                          backgroundColor: dayData.available ? colors.success : colors.border
+                        }]}>
+                          <Text style={[styles.dayBadgeText, {
+                            color: dayData.available ? '#fff' : colors.textMuted
+                          }]}>
+                            {day.slice(0, 3)}
+                          </Text>
+                        </View>
+                        <View>
+                          <Text style={[styles.dayName, { color: colors.text }]}>{day}</Text>
+                          <Text style={[styles.dayStatus, {
+                            color: dayData.available ? colors.success : colors.textMuted
+                          }]}>
+                            {dayData.available ? '✓ Available' : '✗ Unavailable'}
+                          </Text>
+                        </View>
+                      </View>
+
+                      <TouchableOpacity
+                        onPress={() => toggleAvailability(day)}
+                        style={[styles.toggle, {
+                          backgroundColor: dayData.available ? colors.success : colors.border
+                        }]}
+                      >
+                        <View style={[styles.toggleThumb, {
+                          transform: [{ translateX: dayData.available ? 20 : 0 }]
+                        }]} />
+                      </TouchableOpacity>
+                    </View>
+
+                    {dayData.available && (
+                      <View style={[styles.timeInputs, { backgroundColor: colors.background }]}>
+                        <View style={styles.timeInputGroup}>
+                          <Text style={[styles.timeLabel, { color: colors.textMuted }]}>From</Text>
+                          <TextInput
+                            style={[styles.timeInput, { 
+                              color: colors.text,
+                              borderColor: colors.border
+                            }]}
+                            value={dayData.from}
+                            onChangeText={(text) => updateTime(day, 'from', text)}
+                            placeholder="09:00"
+                          />
+                        </View>
+                        <Ionicons name="arrow-forward" size={20} color={colors.textMuted} />
+                        <View style={styles.timeInputGroup}>
+                          <Text style={[styles.timeLabel, { color: colors.textMuted }]}>To</Text>
+                          <TextInput
+                            style={[styles.timeInput, { 
+                              color: colors.text,
+                              borderColor: colors.border
+                            }]}
+                            value={dayData.to}
+                            onChangeText={(text) => updateTime(day, 'to', text)}
+                            placeholder="17:00"
+                          />
+                        </View>
+                      </View>
+                    )}
+                  </View>
+                );
+              })}
+            </ScrollView>
+
+            <TouchableOpacity
+              style={[styles.saveAvailabilityBtn, { backgroundColor: colors.primary }]}
+              onPress={handleSaveAvailability}
+              disabled={availabilityLoading}
+            >
+              {availabilityLoading ? (
+                <ActivityIndicator color="#fff" />
+              ) : (
+                <Text style={styles.saveAvailabilityBtnText}>Save Changes</Text>
+              )}
+            </TouchableOpacity>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
+
+      {/* Appointment Modal */}
+     <AppointmentModal
+  appointment={selectedAppointment}
+  visible={showModal}
+  onClose={() => setShowModal(false)}
+  onAccept={handleAccept}
+  onReject={handleReject}
+  onJoinCall={handleJoinCall}  // ✅ Pass the join call handler
+  getEffectiveStatus={getEffectiveStatus}
+  role={"doctor"}
+  isProcessing={!!processingId}
+/>
+
+      <DoctorBottomBar activeRoute="DoctorDashboardScreen" messagesCount={messagesCount} />
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  screen: {
+    flex: 1,
+  },
+  scrollContent: {
+    paddingBottom: 120,
+  },
+  headerGradient: {
+    paddingVertical: 22,
+    paddingHorizontal: 20,
+    borderBottomLeftRadius: RADIUS.lg,
+    borderBottomRightRadius: RADIUS.lg,
+    marginBottom: SPACING.sm,
+  },
+  headerTop: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  doctorInfo: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+  },
+  avatar: {
+    width: 58,
+    height: 58,
+    borderRadius: 50,
+    backgroundColor: "#ddd",
+  },
+  greeting: {
+    fontSize: 14,
+    opacity: 0.8,
+  },
+  doctorName: {
+    fontSize: 20,
+    fontWeight: "700",
+  },
+  notificationBadge: {
+    position: "absolute",
+    top: -6,
+    right: -6,
+    backgroundColor: "#D81E5B",
+    paddingHorizontal: 6,
+    height: 18,
+    minWidth: 18,
+    justifyContent: "center",
+    alignItems: "center",
+    borderRadius: 10,
+  },
+  notificationBadgeText: {
+    color: "#fff",
+    fontSize: 10,
+    fontWeight: "700",
+  },
+  statsRow: {
+    flexDirection: "row",
+    gap: 10,
+    paddingHorizontal: 16,
+  },
+  statItem: {
+    flex: 1,
+    padding: 14,
+    borderRadius: RADIUS.sm,
+    alignItems: "center",
+    justifyContent: "center",
+    ...SHADOW.low,
+  },
+  statLabel: {
+    fontSize: 12,
+    marginBottom: 4,
+  },
+  statValue: {
+    fontSize: 22,
+    fontWeight: "700",
+  },
+  section: {
+    marginTop: SPACING.md,
+    paddingHorizontal: 16,
+  },
+  sectionTitle: {
+    fontSize: 18,
+    fontWeight: "700",
+    marginBottom: 12,
+  },
+  sectionHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 10,
+  },
+  manageBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: RADIUS.sm,
+  },
+  manageBtnText: {
+    color: "#fff",
+    fontSize: 14,
+    fontWeight: "700",
+  },
+  upNextCard: {
+    borderRadius: RADIUS.md,
+    padding: 20,
+    paddingLeft: 24,
+    overflow: "hidden",
+    ...SHADOW.medium,
+  },
+  upNextAccent: {
+    position: "absolute",
+    left: 0,
+    top: 0,
+    bottom: 0,
+    width: 5,
+  },
+  upNextTime: {
+    fontSize: 14,
+    fontWeight: "700",
+    marginBottom: 6,
+  },
+  upNextPatient: {
+    fontSize: 18,
+    fontWeight: "700",
+    marginBottom: 6,
+  },
+  upNextCondition: {
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  upNextActions: {
+    flexDirection: "row",
+    marginTop: 16,
+    gap: 10,
+  },
+  joinButton: {
+    flex: 1,
+    paddingVertical: 10,
+    borderRadius: RADIUS.sm,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  joinButtonText: {
+    color: "#fff",
+    fontSize: 15,
+    fontWeight: "600",
+  },
+  viewDetailsButton: {
+    flex: 1,
+    paddingVertical: 10,
+    borderRadius: RADIUS.sm,
+    borderWidth: 1.5,
+    alignItems: "center",
+  },
+  viewDetailsButtonText: {
+    fontSize: 15,
+    fontWeight: "600",
+  },
+  emptyStateCard: {
+    padding: 24,
+    borderRadius: RADIUS.md,
+    alignItems: "center",
+    justifyContent: "center",
+    marginTop: 10,
+    opacity: 0.8,
+  },
+  emptyText: {
+    marginTop: 6,
+    fontSize: 14,
+    textAlign: "center",
+  },
+  availabilitySummary: {
+    marginTop: 10,
+    padding: 18,
+    borderRadius: RADIUS.md,
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    ...SHADOW.medium,
+  },
+  summaryItem: {
+    alignItems: "center",
+    flex: 1,
+  },
+  summaryLabel: {
+    color: "#EDE9FE",
+    fontSize: 13,
+    marginBottom: 4,
+  },
+  summaryValue: {
+    color: "#fff",
+    fontSize: 22,
+    fontWeight: "700",
+  },
+  summaryDivider: {
+    width: 1,
+    height: "70%",
+    backgroundColor: "rgba(255,255,255,0.3)",
+  },
+  daysPreview: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    marginTop: 14,
+  },
+  dayChip: {
+    borderRadius: RADIUS.sm,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+  },
+  dayChipText: {
+    fontWeight: "700",
+    fontSize: 12,
+  },
+  scheduleScroll: {
+    paddingVertical: 12,
+  },
+  scheduleDate: {
+    padding: 12,
+    marginRight: 10,
+    borderRadius: RADIUS.sm,
+    alignItems: "center",
+    width: 70,
+    ...SHADOW.low,
+  },
+  dayText: {
+    fontSize: 12,
+  },
+  dateText: {
+    fontSize: 20,
+    fontWeight: "700",
+    marginTop: 2,
+  },
+  appointmentDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 50,
+    marginTop: 4,
+  },
+  appointmentList: {
+    marginTop: 16,
+  },
+  appointmentCard: {
+    padding: 14,
+    borderRadius: RADIUS.md,
+    marginBottom: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    ...SHADOW.low,
+  },
+  appointmentLeft: {
+    width: 70,
+  },
+  appointmentTime: {
+    fontSize: 16,
+    fontWeight: "700",
+  },
+  appointmentRight: {
+    flex: 1,
+  },
+  appointmentPatient: {
+    fontSize: 16,
+    fontWeight: "600",
+  },
+  appointmentType: {
+    fontSize: 12,
+    marginTop: 3,
+  },
+  appointmentIcon: {
+    marginLeft: 10,
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.4)",
+    justifyContent: "flex-end",
+  },
+  availabilityModal: {
+    maxHeight: "85%",
+    paddingHorizontal: 18,
+    paddingTop: 16,
+    paddingBottom: 30,
+    borderTopLeftRadius: RADIUS.lg,
+    borderTopRightRadius: RADIUS.lg,
+    elevation: 10,
+  },
+  availabilityModalHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 14,
+  },
+  availabilityModalTitle: {
+    fontSize: 20,
+    fontWeight: "700",
+  },
+  availabilityModalContent: {
+    marginTop: 10,
+  },
+  quickActions: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginBottom: 16,
+  },
+  quickActionBtn: {
+    flex: 1,
+    flexDirection: "row",
+    paddingVertical: 10,
+    marginHorizontal: 4,
+    borderRadius: RADIUS.sm,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 5,
+    ...SHADOW.low,
+  },
+  quickActionText: {
+    fontSize: 12,
+    fontWeight: "600",
+  },
+  dayCard: {
+    padding: 14,
+    borderRadius: RADIUS.md,
+    marginBottom: 14,
+    borderWidth: 1,
+  },
+  dayCardHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  dayCardLeft: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  dayBadge: {
+    width: 42,
+    height: 42,
+    borderRadius: 50,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  dayBadgeText: {
+    fontWeight: "700",
+  },
+  dayName: {
+    fontSize: 16,
+    fontWeight: "700",
+  },
+  dayStatus: {
+    fontSize: 12,
+    marginTop: 2,
+  },
+  toggle: {
+    width: 48,
+    height: 26,
+    borderRadius: 20,
+    padding: 3,
+    justifyContent: "center",
+  },
+  toggleThumb: {
+    width: 20,
+    height: 20,
+    borderRadius: 20,
+    backgroundColor: "#fff",
+  },
+  timeInputs: {
+    marginTop: 16,
+    padding: 12,
+    borderRadius: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 14,
+    elevation: 1,
+    shadowColor: "#000",
+    shadowOpacity: 0.05,
+    shadowRadius: 2,
+    shadowOffset: { width: 0, height: 1 },
+  },
+  timeInputGroup: {
+    flex: 1,
+  },
+  timeLabel: {
+    fontSize: 12,
+    marginBottom: 4,
+  },
+  timeInput: {
+    borderWidth: 1,
+    borderRadius: 10,
+    padding: 8,
+    fontSize: 14,
+  },
+  saveAvailabilityBtn: {
+    paddingVertical: 14,
+    marginTop: 14,
+    borderRadius: RADIUS.sm,
+    alignItems: "center",
+  },
+  saveAvailabilityBtnText: {
+    color: "#fff",
+    fontSize: 16,
+    fontWeight: "700",
+  },
+  loadingContainer: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    gap: 10,
+  },
+  loadingText: {
+    fontSize: 15,
+  },
+  quickAccessCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    padding: 16,
+    borderRadius: RADIUS.md,
+    ...SHADOW.low,
+    gap: 12,
+  },
+  quickAccessIcon: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  quickAccessContent: {
+    flex: 1,
+  },
+  quickAccessTitle: {
+    fontSize: 16,
+    fontWeight: "700",
+  },
+  quickAccessSubtitle: {
+    fontSize: 13,
+    marginTop: 2,
+  },
+});

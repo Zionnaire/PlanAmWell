@@ -1,0 +1,200 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import { useParams } from "next/navigation";
+import Link from "next/link";
+import { apiGet, apiPost } from "@/lib/api";
+import { Button } from "@/components/ui/Button";
+import { GuestGate } from "@/components/auth/GuestGate";
+import { PharmacyOrder } from "@/lib/types";
+
+const POLL_INTERVAL_MS = 4000;
+
+const PAYMENT_COPY: Record<PharmacyOrder["paymentStatus"], { label: string; className: string }> = {
+  pending: { label: "Payment pending", className: "bg-accent-amber-bg text-accent-amber-fg" },
+  paid: { label: "Payment successful", className: "bg-green-100 text-green-700" },
+  failed: { label: "Payment failed", className: "bg-accent-pink-bg text-accent-pink-fg" },
+  refunded: { label: "Refunded", className: "bg-accent-gray-bg text-accent-gray-fg" },
+};
+
+export default function OrderDetailPage() {
+  return (
+    <GuestGate feature="Order details">
+      <OrderDetailPageContent />
+    </GuestGate>
+  );
+}
+
+function OrderDetailPageContent() {
+  const params = useParams<{ id: string }>();
+  const [order, setOrder] = useState<PharmacyOrder | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [paying, setPaying] = useState(false);
+  const [payError, setPayError] = useState<string | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  function load() {
+    apiGet<{ success: boolean; data?: PharmacyOrder; message?: string }>(`/api/orders/${params.id}`).then(
+      ({ data }) => {
+        if (data.success && data.data) {
+          setOrder(data.data);
+          if (data.data.paymentStatus !== "pending" && pollRef.current) {
+            clearInterval(pollRef.current);
+            pollRef.current = null;
+          }
+        } else {
+          setError(data.message ?? "Could not load this order.");
+        }
+      }
+    );
+  }
+
+  // The real (partner) payment path only updates Order.paymentStatus via an
+  // external webhook — plain polling of the order record just re-reads
+  // whatever that webhook last wrote, which does nothing if the webhook
+  // never fires (sandbox quirks, delivery delays, misconfiguration). This
+  // actively asks the backend to check the real status with the partner
+  // directly, the same fallback the mobile app's useOrderDetails hook
+  // already has, instead of trusting the webhook alone.
+  async function verifyAndLoad() {
+    try {
+      const { data: paymentData } = await apiGet<{ success: boolean; data?: { paymentReference?: string } }>(
+        `/api/payment/by-order/${params.id}`
+      );
+      const paymentReference = paymentData.data?.paymentReference;
+      if (paymentReference) {
+        await apiPost(`/api/payment/verify`, { paymentReference });
+      }
+    } catch {
+      // Best-effort — fall through to a plain reload either way.
+    }
+    load();
+  }
+
+  async function handlePayNow() {
+    if (!order) return;
+    setPaying(true);
+    setPayError(null);
+    const { data } = await apiPost<{ success: boolean; message?: string; data?: { checkoutUrl?: string } }>(
+      "/api/payment/initiate",
+      { orderId: order._id }
+    );
+    if (data.success && data.data?.checkoutUrl) {
+      window.location.href = data.data.checkoutUrl;
+      return;
+    }
+    setPaying(false);
+    setPayError(data.message ?? "Could not start payment. Please try again.");
+  }
+
+  useEffect(() => {
+    verifyAndLoad();
+    // Mirrors the mobile app's useOrderDetails hook: poll (and actively
+    // verify) while payment is still pending, since the redirect page
+    // itself carries no status.
+    pollRef.current = setInterval(verifyAndLoad, POLL_INTERVAL_MS);
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [params.id]);
+
+  if (error) {
+    return (
+      <div>
+        <p className="text-sm text-red-600">{error}</p>
+        <Link href="/app/orders" className="mt-4 inline-block text-sm font-semibold text-primary">
+          &larr; Back to orders
+        </Link>
+      </div>
+    );
+  }
+
+  if (!order) {
+    return <p className="text-sm text-muted">Loading order...</p>;
+  }
+
+  const paymentInfo = PAYMENT_COPY[order.paymentStatus];
+
+  return (
+    <div>
+      <Link href="/app/orders" className="text-sm font-semibold text-primary">
+        &larr; Back to orders
+      </Link>
+
+      <div className="mx-auto mt-4 max-w-2xl rounded-card bg-card-bg shadow-atmospheric p-6">
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="font-bold text-heading">Order #{order.orderNumber.slice(0, 8)}</h1>
+            <p className="text-xs text-muted">{new Date(order.createdAt).toLocaleString()}</p>
+          </div>
+          <span className={`rounded-full px-3 py-1 text-xs font-semibold ${paymentInfo.className}`}>
+            {paymentInfo.label}
+          </span>
+        </div>
+
+        {order.paymentStatus === "pending" && (
+          <div className="mt-4 rounded-2xl border border-accent-amber-fg/20 bg-accent-amber-bg/40 p-4">
+            <p className="text-sm text-heading">This order hasn&apos;t been paid for yet.</p>
+            <p className="mt-1 text-xs text-muted">
+              This page updates automatically once payment is confirmed.
+            </p>
+            {payError && <p className="mt-2 text-xs text-red-600">{payError}</p>}
+            <Button className="mt-3 h-11 px-6 text-sm" loading={paying} onClick={handlePayNow}>
+              {paying ? "Starting payment..." : "Complete Payment"}
+            </Button>
+          </div>
+        )}
+
+        <div className="mt-5 flex flex-col gap-2">
+          {order.items.map((item, i) => (
+            <div key={i} className="flex items-center justify-between text-sm">
+              <span className="text-heading">
+                {item.name ?? item.productId} &times; {item.qty}
+              </span>
+              <span className="text-muted">₦{(item.price * item.qty).toLocaleString()}</span>
+            </div>
+          ))}
+        </div>
+
+        <div className="mt-4 border-t border-border pt-3">
+          <div className="flex justify-between text-sm">
+            <span className="text-muted">Subtotal</span>
+            <span className="text-heading">₦{order.subtotal.toLocaleString()}</span>
+          </div>
+          <div className="mt-1 flex justify-between text-sm">
+            <span className="text-muted">Delivery</span>
+            <span className="text-heading">₦{order.shippingFee.toLocaleString()}</span>
+          </div>
+          <div className="mt-2 flex justify-between font-bold text-heading">
+            <span>Total</span>
+            <span>₦{order.total.toLocaleString()}</span>
+          </div>
+        </div>
+
+        {order.shippingAddress && (
+          <div className="mt-5 border-t border-border pt-3">
+            <p className="text-xs font-semibold uppercase text-muted">Delivery address</p>
+            <p className="mt-1 text-sm text-body">
+              {[
+                order.shippingAddress.addressLine,
+                order.shippingAddress.city,
+                order.shippingAddress.lga,
+                order.shippingAddress.state,
+              ]
+                .filter(Boolean)
+                .join(", ")}
+            </p>
+          </div>
+        )}
+
+        {order.deliveryStatus && (
+          <div className="mt-4 border-t border-border pt-3">
+            <p className="text-xs font-semibold uppercase text-muted">Delivery status</p>
+            <p className="mt-1 text-sm capitalize text-body">{order.deliveryStatus}</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

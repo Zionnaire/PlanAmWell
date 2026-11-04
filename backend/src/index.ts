@@ -1,0 +1,704 @@
+// index.ts - FIXED Socket.IO with Appointment Rooms
+
+import dotenv from "dotenv";
+dotenv.config();
+
+import express from "express";
+import cors from "cors";
+import helmet from "helmet";
+import morgan from "morgan";
+import http from "http";
+import mongoose from "mongoose";
+import { errorHandler } from "./middleware/errorHandler";
+
+import "./cron/reminderJob";
+import { prewarmMissingCitiesOnStartup } from "./cron/clinicPrewarmJob";
+
+// Import routers
+import categoryRouter from "./routes/categoryRoutes";
+import productRouter from "./routes/productRoutes";
+import doctorRouter from "./routes/doctorRoutes";
+import orderRouter from "./routes/orderRoutes";
+import authRouter from "./routes/authRoutes";
+import userRouter from "./routes/userRoutes";
+import checkoutRouter from "./routes/checkoutRoutes";
+import cartRouter from "./routes/cartRoutes";
+import paymentRouter from "./routes/paymentRoutes";
+import notificationRouter from "./routes/notificationRoutes";
+import chatBotRouter from "./routes/chatbotRoutes";
+import whatsappRouter from "./routes/metaWhatsapp";
+import advocacyRouter from "./routes/advocacyRoutes";
+import commentRouter from "./routes/commentRoutes";
+import adminRouter from "./routes/adminRoutes";
+import appointmentRouter from "./routes/appointmentRoutes";
+import videoRouter from "./routes/videoRoutes";
+import partnerRouter from "./routes/partnerRoutes";
+import cronRouter from "./routes/cron";
+import chatRouter from "./routes/chatRoutes";
+import medicalRecordRouter from "./routes/medicalRecordRoutes";
+import webhookRouter from "./routes/webhookRoutes";
+import hospitalRouter from "./routes/hospitalRoutes";
+import medicationReminderRouter from "./routes/medicationReminderRoutes";
+import familyMemberRouter from "./routes/familyMemberRoutes";
+import eventRouter from "./routes/eventRoutes";
+import reviewRouter from "./routes/reviewRoutes";
+import platformSettingsRouter from "./routes/platformSettingsRoutes";
+import legalRouter from "./routes/legalRoutes";
+import searchRouter from "./routes/searchRoutes";
+
+import { Server } from "socket.io";
+import { verifyJwtToken } from "./middleware/auth";
+import rateLimit from "express-rate-limit";
+
+const app = express();
+const server = http.createServer(app);
+
+// Render (and most PaaS hosts) sit exactly one reverse-proxy hop in front of
+// this process. Without this, Express can't see the real client IP — req.ip
+// resolves to the proxy's address for every request, so express-rate-limit's
+// IP-based keying collapses all external users onto the same bucket instead
+// of limiting per-visitor.
+//
+// The web app (Next.js) adds a SECOND hop for browser traffic: browser ->
+// Next.js server -> Render -> this process. Next.js forwards the real
+// visitor IP via X-Forwarded-For, but Express only walks back through hops
+// it's told to trust. TRUSTED_PROXY_IPS lets the web app's own egress
+// IP(s) be trusted once known (set as a comma-separated list once the web
+// app is deployed) WITHOUT changing anything for mobile, which only ever
+// presents the one Render hop this always trusts. Until that env var is
+// set, behavior is identical to the previous `trust proxy: 1` — web
+// traffic's req.ip will resolve to the Next.js server's address (same
+// single-hop assumption as before) rather than the real browser, which is
+// safe (just less precise) until the env var is configured.
+const TRUSTED_PROXY_IPS = (process.env.TRUSTED_PROXY_IPS ?? "")
+  .split(",")
+  .map((ip) => ip.trim())
+  .filter(Boolean);
+
+app.set("trust proxy", (addr: string, hopIndex: number) => {
+  if (hopIndex === 0) return true; // Render's own edge — always trust, as before
+  return TRUSTED_PROXY_IPS.includes(addr);
+});
+
+// Build CORS origin list from env (comma-separated). Mobile apps have no Origin header,
+// so we always allow requests with no origin (React Native / Expo / Postman).
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(",").map((o) => o.trim())
+  : [];
+
+function isCorsAllowed(origin: string | undefined): boolean {
+  if (!origin) return true; // mobile apps, curl, etc.
+  if (ALLOWED_ORIGINS.length === 0) return true; // env not set — allow all (dev)
+  return ALLOWED_ORIGINS.includes(origin);
+}
+
+export const io = new Server(server, {
+  cors: {
+    origin: (origin, callback) => {
+      if (isCorsAllowed(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error(`CORS: origin ${origin} not allowed`));
+      }
+    },
+    methods: ["GET", "POST"],
+    credentials: true,
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+  },
+  transports: ["websocket", "polling"],
+  allowEIO3: true,
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  connectTimeout: 45000,
+  serveClient: false,
+  cookie: false,
+});
+
+// ✅ Track connected users (for notifications)
+const connectedUsers = new Map<string, string>(); // userId -> socketId
+
+// ✅ Track appointment room memberships
+const appointmentRooms = new Map<string, Set<string>>(); // appointmentId -> Set of userIds
+
+// ✅ Socket.IO Authentication Middleware
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+
+  if (!token) {
+    console.log("❌ Socket connection rejected: No token");
+    return next(new Error("Authentication error: No token provided"));
+  }
+
+  try {
+    const user = verifyJwtToken(token);
+
+    if (!user || !user.id) {
+      console.log("❌ Socket connection rejected: Invalid token");
+      return next(new Error("Authentication error: Invalid token"));
+    }
+
+    socket.data.user = user;
+    console.log(`✅ Socket authenticated for user ${user.id}`);
+    next();
+  } catch (err: any) {
+    console.error("❌ Socket auth error:", err.message);
+    return next(new Error("Authentication error: Token verification failed"));
+  }
+});
+
+// ✅ Connection Handler
+io.on("connection", (socket) => {
+  const user = socket.data.user;
+
+  if (!user || !user.id) {
+    console.log("❌ No user data, disconnecting socket");
+    return socket.disconnect();
+  }
+
+  const userId = user.id.toString();
+  const userRoomName = `user_${userId}`;
+
+  // Join user-specific room (for notifications)
+  socket.join(userRoomName);
+  connectedUsers.set(userId, socket.id);
+
+  console.log(`🔌 User ${userId} connected (socket: ${socket.id})`);
+  console.log(`📍 Active connections: ${connectedUsers.size}`);
+  console.log(`🔌 Transport: ${socket.conn.transport.name}`);
+
+  // ✅ Emit connection success to client
+  socket.emit("connected", {
+    userId,
+    socketId: socket.id,
+    message: "Successfully connected to notification server",
+    timestamp: new Date().toISOString(),
+  });
+
+  // ✅ Join appointment room
+  socket.on("join-appointment", ({ appointmentId }: { appointmentId: string }) => {
+    const roomName = `appointment:${appointmentId}`;
+    socket.join(roomName);
+
+    // Track membership
+    if (!appointmentRooms.has(appointmentId)) {
+      appointmentRooms.set(appointmentId, new Set());
+    }
+    appointmentRooms.get(appointmentId)!.add(userId);
+
+    console.log(`📡 User ${userId} joined appointment room: ${roomName}`);
+    console.log(`👥 Room ${appointmentId} has ${appointmentRooms.get(appointmentId)!.size} members`);
+  });
+
+  // ✅ Leave appointment room
+  socket.on("leave-appointment", ({ appointmentId }: { appointmentId: string }) => {
+    const roomName = `appointment:${appointmentId}`;
+    socket.leave(roomName);
+
+    // Remove from tracking
+    if (appointmentRooms.has(appointmentId)) {
+      appointmentRooms.get(appointmentId)!.delete(userId);
+      if (appointmentRooms.get(appointmentId)!.size === 0) {
+        appointmentRooms.delete(appointmentId);
+      }
+    }
+
+    console.log(`📡 User ${userId} left appointment room: ${roomName}`);
+  });
+
+  // ✅ Handle manual notification read from client
+  socket.on("mark-notification-read", async (notificationId: string) => {
+    try {
+      console.log(`✅ User ${userId} marked notification ${notificationId} as read`);
+    } catch (error) {
+      console.error("Error marking notification as read:", error);
+    }
+  });
+
+  // ✅ Handle ping from client
+  socket.on("ping", () => {
+    socket.emit("pong", { timestamp: Date.now() });
+  });
+
+  // ─── WebRTC signaling relay ──────────────────────────────────────────────
+  // All four events are relayed to everyone ELSE in the appointment room.
+  // socket.to() excludes the sender, so there is no echo back.
+
+  socket.on("webrtc-ready", ({ appointmentId }: { appointmentId: string }) => {
+    const roomName = `appointment:${appointmentId}`;
+    socket.to(roomName).emit("webrtc-ready", { appointmentId });
+    console.log(`🎥 webrtc-ready relayed for appointment ${appointmentId} by user ${userId}`);
+  });
+
+  socket.on("webrtc-offer", ({ appointmentId, offer }: { appointmentId: string; offer: any }) => {
+    const roomName = `appointment:${appointmentId}`;
+    socket.to(roomName).emit("webrtc-offer", { appointmentId, offer });
+    console.log(`🎥 webrtc-offer relayed for appointment ${appointmentId}`);
+  });
+
+  socket.on("webrtc-answer", ({ appointmentId, answer }: { appointmentId: string; answer: any }) => {
+    const roomName = `appointment:${appointmentId}`;
+    socket.to(roomName).emit("webrtc-answer", { appointmentId, answer });
+    console.log(`🎥 webrtc-answer relayed for appointment ${appointmentId}`);
+  });
+
+  socket.on("webrtc-ice-candidate", ({ appointmentId, candidate }: { appointmentId: string; candidate: any }) => {
+    const roomName = `appointment:${appointmentId}`;
+    socket.to(roomName).emit("webrtc-ice-candidate", { appointmentId, candidate });
+  });
+
+  // Explicit UI-sync signal for mid-call video<->voice switching. The actual
+  // media renegotiation still goes through webrtc-offer/answer above — this
+  // just tells the other screen which layout to show, since detecting a
+  // removed track reliably via WebRTC's own events is far less dependable
+  // than detecting an added one (which ontrack already handles).
+  socket.on("webrtc-call-mode-changed", ({ appointmentId, callMode }: { appointmentId: string; callMode: "audio" | "video" }) => {
+    const roomName = `appointment:${appointmentId}`;
+    socket.to(roomName).emit("webrtc-call-mode-changed", { appointmentId, callMode });
+    console.log(`🎥 webrtc-call-mode-changed (${callMode}) relayed for appointment ${appointmentId}`);
+  });
+  // ────────────────────────────────────────────────────────────────────────
+
+  // ✅ Handle disconnect
+  socket.on("disconnect", (reason) => {
+    connectedUsers.delete(userId);
+
+    // Remove user from all appointment rooms
+    appointmentRooms.forEach((members, appointmentId) => {
+      members.delete(userId);
+      if (members.size === 0) {
+        appointmentRooms.delete(appointmentId);
+      }
+    });
+
+    console.log(`🔌 User ${userId} disconnected. Reason: ${reason}`);
+    console.log(`📍 Active connections: ${connectedUsers.size}`);
+  });
+
+  // ✅ Handle errors
+  socket.on("error", (error) => {
+    console.error(`❌ Socket error for user ${userId}:`, error);
+  });
+});
+
+// ✅ Emit notification to user (for push notifications)
+export const emitNotification = (userId: string, notification: any) => {
+  try {
+    const roomName = `user_${userId}`;
+    const userSocketId = connectedUsers.get(userId);
+
+    if (userSocketId) {
+      io.to(roomName).emit("notification", notification);
+      console.log(`🔔 Real-time notification sent to user ${userId} (socket: ${userSocketId})`);
+      return true;
+    } else {
+      console.log(`⚠️ User ${userId} not connected, notification queued for next login`);
+      return false;
+    }
+  } catch (error) {
+    console.error(`❌ Failed to emit notification to user ${userId}:`, error);
+    return false;
+  }
+};
+
+// ✅ Emit rejoin call alert to specific user
+export const emitRejoinCallAlert = (
+  userId: string,
+  appointmentId: string,
+  userName: string
+) => {
+  try {
+    const roomName = `user_${userId}`;
+    const userSocketId = connectedUsers.get(userId);
+
+    if (userSocketId) {
+      io.to(roomName).emit("patient-rejoin-call", {
+        appointmentId,
+        userName,
+        message: `${userName} is in the call and waiting for you.`,
+        timestamp: new Date().toISOString(),
+      });
+      console.log(`📞 Rejoin call alert sent to user ${userId}`);
+      return true;
+    } else {
+      console.log(`⚠️ User ${userId} not online`);
+      return false;
+    }
+  } catch (error) {
+    console.error(`❌ Failed to emit rejoin alert:`, error);
+    return false;
+  }
+};
+
+// ✅ FIXED: Emit call ended to APPOINTMENT ROOM (not individual users)
+export const emitCallEnded = (
+  userId: string,
+  appointmentId: string,
+  callDuration?: number
+) => {
+  try {
+    const roomName = `appointment:${appointmentId}`;
+
+    // Emit to appointment room (both doctor and patient will receive it)
+    io.to(roomName).emit("call-ended", {
+      appointmentId,
+      callDuration,
+      timestamp: new Date().toISOString(),
+    });
+
+    const membersCount = appointmentRooms.get(appointmentId)?.size || 0;
+    console.log(`📞 Call ended notification sent to appointment room ${appointmentId} (${membersCount} members)`);
+
+    return true;
+  } catch (error) {
+    console.error(`❌ Failed to emit call ended:`, error);
+    return false;
+  }
+};
+
+// ✅ NEW: Emit call started to appointment room
+export const emitCallStarted = (appointmentId: string, startedBy: string) => {
+  try {
+    const roomName = `appointment:${appointmentId}`;
+
+    io.to(roomName).emit("call-started", {
+      appointmentId,
+      startedBy,
+      timestamp: new Date().toISOString(),
+    });
+
+    console.log(`📞 Call started notification sent to appointment room ${appointmentId}`);
+    return true;
+  } catch (error) {
+    console.error(`❌ Failed to emit call started:`, error);
+    return false;
+  }
+};
+
+// ✅ NEW: Emit appointment updated to appointment room
+export const emitAppointmentUpdated = (appointmentId: string, appointment: any) => {
+  try {
+    const roomName = `appointment:${appointmentId}`;
+
+    io.to(roomName).emit("appointment-updated", {
+      appointment,
+      timestamp: new Date().toISOString(),
+    });
+
+    console.log(`📞 Appointment updated notification sent to room ${appointmentId}`);
+    return true;
+  } catch (error) {
+    console.error(`❌ Failed to emit appointment updated:`, error);
+    return false;
+  }
+};
+
+export const emitNewMessage = (
+  conversationId: string,
+  message: any,
+  recipientId: string
+) => {
+  try {
+    const roomName = `user_${recipientId}`;
+    
+    io.to(roomName).emit("new-message", {
+      conversationId,
+      message,
+      timestamp: new Date().toISOString(),
+    });
+    
+    console.log(`💬 New message sent to user ${recipientId}`);
+    return true;
+  } catch (error) {
+    console.error(`❌ Failed to emit new message:`, error);
+    return false;
+  }
+};
+
+// ✅ NEW: Emit typing indicator
+export const emitTypingIndicator = (
+  conversationId: string,
+  recipientId: string,
+  isTyping: boolean,
+  senderRole: string
+) => {
+  try {
+    const roomName = `user_${recipientId}`;
+    
+    io.to(roomName).emit("typing-indicator", {
+      conversationId,
+      isTyping,
+      senderRole,
+      timestamp: new Date().toISOString(),
+    });
+    
+    return true;
+  } catch (error) {
+    console.error(`❌ Failed to emit typing indicator:`, error);
+    return false;
+  }
+};
+
+// ✅ NEW: Emit message read receipt
+export const emitMessageRead = (
+  conversationId: string,
+  recipientId: string
+) => {
+  try {
+    const roomName = `user_${recipientId}`;
+    
+    io.to(roomName).emit("messages-read", {
+      conversationId,
+      timestamp: new Date().toISOString(),
+    });
+    
+    return true;
+  } catch (error) {
+    console.error(`❌ Failed to emit message read:`, error);
+    return false;
+  }
+};
+
+// ✅ NEW: Emit video call response
+export const emitVideoCallResponse = (
+  conversationId: string,
+  requesterId: string,
+  status: "accepted" | "declined" | "expired" | "cancelled",
+  requestId: string,
+  callType?: "audio" | "video"
+) => {
+  try {
+    const roomName = `user_${requesterId}`;
+
+    io.to(roomName).emit("video-call-response", {
+      conversationId,
+      status,
+      requestId,
+      callType,
+      timestamp: new Date().toISOString(),
+    });
+    
+    console.log(`📞 Video call response (${status}) sent to user ${requesterId}`);
+    return true;
+  } catch (error) {
+    console.error(`❌ Failed to emit video call response:`, error);
+    return false;
+  }
+};
+
+
+/**
+ * Emit appointment-ended to the appointment room.
+ * Both doctor and patient receive this and lock their UI.
+ */
+export const emitAppointmentEnded = (
+  appointmentId: string,
+  patientId?: string,
+  doctorId?: string
+) => {
+  try {
+    const payload = { appointmentId, timestamp: new Date().toISOString() };
+
+    // 1. Broadcast to appointment room (catches anyone already in the chat)
+    io.to(`appointment:${appointmentId}`).emit("appointment-ended", payload);
+
+    // 2. Also emit directly to each participant's user room so the event
+    //    arrives even if they haven't joined the appointment room yet
+    if (patientId) io.to(`user_${patientId}`).emit("appointment-ended", payload);
+    if (doctorId)  io.to(`user_${doctorId}`).emit("appointment-ended", payload);
+
+    console.log(`🏁 appointment-ended emitted to room + users (patient:${patientId}, doctor:${doctorId})`);
+    return true;
+  } catch (error) {
+    console.error("❌ Failed to emit appointment-ended:", error);
+    return false;
+  }
+};
+
+export const emitAccessRequestUpdate = (
+  doctorId: string,
+  accessRequestId: string,
+  status: "approved" | "denied" | "expired"
+) => {
+  try {
+    const roomName = `user_${doctorId}`;
+    io.to(roomName).emit("access-request-update", {
+      accessRequestId,
+      status,
+      timestamp: new Date().toISOString(),
+    });
+    console.log(`🏥 access-request-update (${status}) sent to doctor ${doctorId}`);
+    return true;
+  } catch (error) {
+    console.error("❌ Failed to emit access-request-update:", error);
+    return false;
+  }
+};
+
+export const emitConversationUnlocked = (conversationId: string, patientId: string) => {
+  // Must use the user room name — NOT the raw userId
+  io.to(`user_${patientId}`).emit("conversation-unlocked", { conversationId });
+  console.log(`🔓 conversation-unlocked emitted to patient ${patientId}`);
+};
+
+// ✅ Helper to check if user is online
+export const isUserOnline = (userId: string): boolean => {
+  return connectedUsers.has(userId);
+};
+
+// ✅ Get all connected users
+export const getConnectedUsers = () => {
+  return Array.from(connectedUsers.keys());
+};
+
+// ✅ Get user's socket ID
+export const getUserSocketId = (userId: string): string | undefined => {
+  return connectedUsers.get(userId);
+};
+
+// ✅ Get appointment room members
+export const getAppointmentRoomMembers = (appointmentId: string): string[] => {
+  return Array.from(appointmentRooms.get(appointmentId) || []);
+};
+
+
+// Middleware
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (isCorsAllowed(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error(`CORS: origin ${origin} not allowed`));
+      }
+    },
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+  })
+);
+
+app.use(
+  helmet({
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+    crossOriginOpenerPolicy: { policy: "same-origin-allow-popups" },
+  })
+);
+
+app.use(
+  express.json({
+    limit: "10mb",
+    // Stash the exact request bytes for anything that needs to verify a
+    // webhook HMAC signature (e.g. appointment payment webhooks) — a
+    // re-serialized req.body can differ byte-for-byte from what was signed.
+    verify: (req: any, _res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
+app.use(express.urlencoded({ limit: "10mb", extended: true }));
+app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
+
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: "Too many requests. Please try again later." },
+});
+app.use("/api/", globalLimiter);
+
+// Health check
+app.get("/", (req, res) => {
+  res.status(200).json({
+    status: "Server is healthy",
+    message: "AskAmWell Backend is operational.",
+    version: "1.0.0",
+    activeConnections: connectedUsers.size,
+    appointmentRooms: appointmentRooms.size,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Public legal pages — Privacy Policy, Terms of Service, web account deletion.
+// Reachable without installing the app, per Google Play Store requirements.
+app.use("/", legalRouter);
+
+// Socket.IO status endpoint — counts only, no user IDs exposed
+app.get("/api/v1/socket/status", (req, res) => {
+  res.json({
+    activeConnections: connectedUsers.size,
+    activeAppointmentRooms: appointmentRooms.size,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Routes
+app.use("/api/v1/admin", adminRouter);
+app.use("/api/v1/notifications", notificationRouter);
+app.use("/api/v1/categories", categoryRouter);
+app.use("/api/v1/products", productRouter);
+app.use("/api/v1/doctors", doctorRouter);
+app.use("/api/v1/orders", orderRouter);
+app.use("/api/v1/auth", authRouter);
+app.use("/api/v1/users", userRouter);
+app.use("/api/v1/chatbot", chatBotRouter);
+app.use("/api/v1/checkout", checkoutRouter);
+app.use("/api/v1/cart", cartRouter);
+app.use("/api/v1/payment", paymentRouter);
+app.use("/api/v1/whatsapp", whatsappRouter);
+app.use("/api/v1/advocacy", advocacyRouter);
+app.use("/api/v1/comment", commentRouter);
+app.use("/api/v1/appointments", appointmentRouter);
+app.use("/api/v1/video", videoRouter);
+app.use("/api/v1/partners", partnerRouter);
+app.use("/api/v1/cron", cronRouter);
+app.use("/api/v1/chat", chatRouter);
+app.use("/api/v1/medical-records", medicalRecordRouter);
+app.use("/api/v1/hospitals", hospitalRouter);
+app.use("/api/v1/webhooks", webhookRouter);
+app.use("/api/v1/medication-reminders", medicationReminderRouter);
+app.use("/api/v1/family", familyMemberRouter);
+app.use("/api/v1/events", eventRouter);
+app.use("/api/v1/reviews", reviewRouter);
+app.use("/api/v1/platform-settings", platformSettingsRouter);
+app.use("/api/v1/search", searchRouter);
+
+app.use(errorHandler);
+
+const PORT: number = Number(process.env.PORT) || 4000;
+
+mongoose
+  .connect(process.env.MONGODB_URI as string)
+  .then(() => {
+    console.log("✅ MongoDB Connected");
+    server.listen(PORT, "0.0.0.0", () => {
+      console.log(`🚀 Server running on port ${PORT}`);
+      console.log(`🔌 Socket.IO server ready`);
+      console.log(`📱 WebSocket endpoint: ws://YOUR_IP:${PORT}`);
+      console.log(`🌐 HTTP endpoint: http://YOUR_IP:${PORT}`);
+    });
+    // Non-blocking — server accepts requests immediately regardless of how
+    // long this takes. See clinicPrewarmJob.ts for why this runs here
+    // (post-connect) rather than as a fixed cron schedule alone.
+    prewarmMissingCitiesOnStartup().catch((err) =>
+      console.error("[ClinicPrewarm] Startup sweep threw:", err)
+    );
+  })
+  .catch((err) => {
+    console.error("❌ MongoDB Connection Error:", err);
+    process.exit(1);
+  });
+
+process.on("unhandledRejection", (err: any) => {
+  console.error("❌ Unhandled Rejection:", err.message);
+  server.close(() => process.exit(1));
+});
+
+process.on("SIGTERM", () => {
+  console.log("👋 SIGTERM received, closing server gracefully");
+  server.close(() => {
+    console.log("✅ Server closed");
+    mongoose.connection.close(false);
+    process.exit(0);
+  });
+});

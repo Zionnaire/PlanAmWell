@@ -1,0 +1,228 @@
+import React from "react";
+import { createStackNavigator } from "@react-navigation/stack";
+import { View, ActivityIndicator, StyleSheet, Text } from "react-native";
+import { useAuth } from "../hooks/useAuth";
+
+import AuthStack from "./AuthStack";
+import HomeScreen from "../screens/home/HomeScreen";
+import AmWellChatModal from "../screens/home/AmWellChatModal";
+import ProductsScreen from "../screens/product/ProductScreen";
+import Productlist from "../screens/product/ProductList";
+import CheckoutScreen from "../screens/cart/CheckoutScreen";
+import PaymentMethodScreen from "../screens/payment/PaymentMethodScreen";
+import WebViewScreen from "../screens/payment/WebViewScreen";
+import ProfileScreen from "../screens/profile/ProfileScreen";
+import PrivacySettingsScreen from "../screens/setting/PrivacySettingsScreen";
+import HelpSupportScreen from "../screens/setting/HelpSupport";
+import SettingsScreen from "../screens/setting/Setting";
+import { DoctorScreen } from "../screens/doctor/DoctorScreen";
+import DoctorProfileScreen from "../screens/doctor/DoctorProfileScreen";
+import DoctorAvailabilityScreen from "../screens/doctor/DoctorAvailabilityScreen";
+import DoctorDashboardScreen from "../screens/doctor/DoctorDashboard";
+import DoctorAppointmentsScreen from "../screens/doctor/DoctorAppointmentsScreen";
+import { BookAppointmentScreen } from "../screens/appointments/BookAppointmentScreen";
+import { MyAppointmentsScreen } from "../screens/appointments/MyAppointmentsScreen";
+import { ConsultationHistoryScreen } from "../screens/appointments/ConsultationHistoryScreen";
+import VideoCallScreen from "../screens/video/VideoCallScreen";
+import AllDoctorsScreen from "../screens/doctor/AllDoctorsScreen";
+import AllActivePartnerScreen from "../screens/partner/AllActivePartnerScreen";
+import ArticleDetailScreen from "../screens/advocacy/articleDetailScreen";
+import AllArticlesScreen from "../screens/advocacy/AllContentScreen";
+import CommunityHubScreen from "../screens/community/CommunityHubScreen";
+import CommunityEventDetailScreen from "../screens/community/CommunityEventDetailScreen";
+import MyEventsScreen from "../screens/community/MyEventsScreen";
+import { NotificationsScreen } from "../screens/notification/notification";
+// Add these imports at the top
+import { ChatRoomScreen } from "../screens/ChatRoomScreen";
+import { ConversationsListScreen } from "../screens/ConversationsListScreen";
+import IncomingCallScreen from "../screens/video/IncomingCallScreen";
+import ConfirmOrderScreen from "../screens/order/ConfirmOrderScreen";
+import OrderDetailsScreen from "../screens/order/OrderDetailsScreen";
+
+import { AppStackParamList } from "../types/App";
+import { IDoctor } from "../types/backendType";
+import { PaymentScreen } from "../screens/payment/PaymentScreen";
+import MedicalRecordEditorScreen from "../screens/doctor/MedicalRecordEditorScreen";
+import PatientRecordScreen from "../screens/doctor/PatientRecordScreen";
+import { MyMedicalRecordScreen } from "../screens/patient/MyMedicalRecordScreen";
+import DoctorPendingScreen from "../screens/doctor/DoctorPendingScreen";
+import DoctorOnboardingScreen from "../screens/doctor/DoctorOnboardingScreen";
+import PrivacyPolicyScreen from "../screens/legal/PrivacyPolicyScreen";
+import TermsOfServiceScreen from "../screens/legal/TermsOfServiceScreen";
+import AboutScreen from "../screens/home/AboutScreen";
+import FindAClinicScreen from "../screens/clinic/FindAClinicScreen";
+import ClinicDetailScreen from "../screens/clinic/ClinicDetailScreen";
+import MedicationRemindersScreen from "../screens/MedicationRemindersScreen";
+import FamilyProfilesScreen from "../screens/FamilyProfilesScreen";
+import PaymentStatusScreen from "../screens/payment/PaymentStatusScreen";
+
+const RootStack = createStackNavigator<AppStackParamList>();
+
+const LoadingScreen = () => (
+  <View style={styles.loadingContainer}>
+    <ActivityIndicator size="large" color="#D81E5B" />
+    <Text style={styles.loadingText}>Initializing Session...</Text>
+  </View>
+);
+
+// Helper to check if user is a doctor
+const isDoctor = (user: any): user is IDoctor =>
+  user && "specialization" in user && "licenseNumber" in user;
+
+// Helper to check if user is approved
+const isApprovedDoctor = (user: any) =>
+  isDoctor(user) && user.status === "approved";
+
+// Doctor is pending review (not yet approved or rejected)
+const isDoctorPending = (user: any) =>
+  isDoctor(user) && (user.status === "submitted" || user.status === "reviewing");
+
+// Doctor application was rejected
+const isDoctorRejected = (user: any) =>
+  isDoctor(user) && user.status === "rejected";
+
+// Approved but hasn't completed onboarding
+const needsOnboarding = (user: any) =>
+  isApprovedDoctor(user) && !user.profileComplete;
+
+export default function AppNavigator() {
+  const { loading, isAuthenticated, isAnonymous, hasSeenOnboarding, user } =
+    useAuth();
+
+  if (loading) return <LoadingScreen />;
+
+  const getInitialRoute = (): keyof AppStackParamList => {
+    if (!hasSeenOnboarding) return "AuthStack";
+    if (isAuthenticated && isAnonymous) return "HomeScreen";
+    if (isAuthenticated && !isAnonymous && user) {
+      if (isDoctor(user)) {
+        if (isDoctorPending(user) || isDoctorRejected(user)) return "DoctorPendingScreen";
+        if (needsOnboarding(user)) return "DoctorOnboardingScreen";
+        if (isApprovedDoctor(user)) return "DoctorDashScreen";
+      }
+      return "HomeScreen";
+    }
+    return "AuthStack";
+  };
+
+  const initialRoute = getInitialRoute();
+
+  return (
+    <RootStack.Navigator
+      initialRouteName={initialRoute}
+      screenOptions={{ headerShown: false }}
+    >
+      {/* Auth */}
+      <RootStack.Screen name="AuthStack" component={AuthStack} />
+
+      {/* Main Screens */}
+      <RootStack.Screen name="HomeScreen" component={HomeScreen} />
+      <RootStack.Screen name="ProductsScreen" component={ProductsScreen} />
+      <RootStack.Screen name="ProductList" component={Productlist} />
+      <RootStack.Screen name="AllDoctorScreen" component={AllDoctorsScreen} />
+      <RootStack.Screen name="ProfileScreen" component={ProfileScreen} />
+      <RootStack.Screen name="SettingsScreen" component={SettingsScreen} />
+      <RootStack.Screen
+        name="PrivacySettingsScreen"
+        component={PrivacySettingsScreen}
+      />
+      <RootStack.Screen name="HelpSupportScreen" component={HelpSupportScreen} />
+      <RootStack.Screen name="CheckoutScreen" component={CheckoutScreen} />
+      <RootStack.Screen name="ConfirmOrderScreen" component={ConfirmOrderScreen} />
+      <RootStack.Screen name="OrderDetailsScreen" component={OrderDetailsScreen} />
+      <RootStack.Screen
+        name="PaymentMethodScreen"
+        component={PaymentMethodScreen}
+      />
+      <RootStack.Screen name="PaymentScreen" component={PaymentScreen} />
+      <RootStack.Screen name="WebViewScreen" component={WebViewScreen} />
+      <RootStack.Screen
+        name="NotificationsScreen"
+        component={NotificationsScreen}
+      />
+
+      {/* Doctor */}
+      <RootStack.Screen name="DoctorScreen" component={DoctorScreen} />
+      <RootStack.Screen name="DoctorDashScreen" component={DoctorDashboardScreen} />
+      <RootStack.Screen name="DoctorAppointment" component={DoctorAppointmentsScreen} />
+      <RootStack.Screen name="DoctorProfileScreen" component={DoctorProfileScreen} />
+      <RootStack.Screen name="DoctorAvailability" component={DoctorAvailabilityScreen} />
+
+      {/* Chat */}
+<RootStack.Screen name="ChatRoomScreen" component={ChatRoomScreen} />
+<RootStack.Screen name="ConversationsListScreen" component={ConversationsListScreen} />
+
+{/* Calls */}
+<RootStack.Screen name="IncomingCall" component={IncomingCallScreen} />
+
+      {/* Appointments */}
+      <RootStack.Screen name="BookAppointmentScreen" component={BookAppointmentScreen} />
+      <RootStack.Screen name="MyAppointments" component={MyAppointmentsScreen} />
+      <RootStack.Screen
+        name="ConsultationHistory"
+        component={ConsultationHistoryScreen}
+      />
+
+      <RootStack.Screen name="MedicalRecordEditorScreen" component={MedicalRecordEditorScreen} />
+<RootStack.Screen name="PatientRecordScreen"        component={PatientRecordScreen} />
+<RootStack.Screen name="MyMedicalRecordScreen"      component={MyMedicalRecordScreen} />
+      <RootStack.Screen name="VideoCallScreen" component={VideoCallScreen} />
+
+      {/* Advocacy */}
+      <RootStack.Screen name="ArticleDetailScreen" component={ArticleDetailScreen} />
+      <RootStack.Screen name="AllArticleScreen" component={AllArticlesScreen} />
+      <RootStack.Screen name="CommunityHubScreen" component={CommunityHubScreen} />
+      <RootStack.Screen name="CommunityEventDetailScreen" component={CommunityEventDetailScreen} />
+      <RootStack.Screen name="MyEventsScreen" component={MyEventsScreen} />
+
+      {/* Partners */}
+      <RootStack.Screen
+        name="AllActivePartnerScreen"
+        component={AllActivePartnerScreen}
+      />
+
+      {/* Doctor Onboarding */}
+      <RootStack.Screen name="DoctorPendingScreen" component={DoctorPendingScreen} />
+      <RootStack.Screen name="DoctorOnboardingScreen" component={DoctorOnboardingScreen} />
+
+      {/* Legal */}
+      <RootStack.Screen name="PrivacyPolicyScreen" component={PrivacyPolicyScreen} />
+      <RootStack.Screen name="TermsOfServiceScreen" component={TermsOfServiceScreen} />
+      <RootStack.Screen name="AboutScreen" component={AboutScreen} />
+
+      {/* Clinics */}
+      <RootStack.Screen name="FindAClinicScreen" component={FindAClinicScreen} />
+      <RootStack.Screen name="ClinicDetailScreen" component={ClinicDetailScreen} />
+
+      {/* Medication Reminders */}
+      <RootStack.Screen name="MedicationRemindersScreen" component={MedicationRemindersScreen} />
+
+      {/* Family Profiles */}
+      <RootStack.Screen name="FamilyProfilesScreen" component={FamilyProfilesScreen} />
+
+      {/* Payment Status */}
+      <RootStack.Screen name="PaymentStatusScreen" component={PaymentStatusScreen} />
+
+      {/* Modals */}
+      <RootStack.Screen
+        name="AmWellChatModal"
+        component={AmWellChatModal}
+        options={{ presentation: "modal" }}
+      />
+    </RootStack.Navigator>
+  );
+}
+
+const styles = StyleSheet.create({
+  loadingContainer: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    backgroundColor: "#FFF",
+  },
+  loadingText: {
+    marginTop: 10,
+    fontSize: 16,
+    color: "#D81E5B",
+  },
+});

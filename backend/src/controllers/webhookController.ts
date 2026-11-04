@@ -1,0 +1,190 @@
+import { Request, Response } from "express";
+import asyncHandler from "../middleware/asyncHandler";
+import { Payment } from "../models/initiatedPayment";
+import { Order } from "../models/order";
+import { createHmac, timingSafeEqual } from "crypto";
+
+const PARTNER_API_KEY= process.env.PARTNER_API_KEY;
+if (!PARTNER_API_KEY) {
+  console.warn("[Webhook] WARNING: PARTNER_API_KEY is not set. Webhook endpoints are unauthenticated.");
+}
+
+const VALID_DELIVERY_STATUSES = ["pending", "processing", "shipped", "delivered", "cancelled", "failed"];
+
+function verifyWebhookSecret(req: Request): boolean {
+  if (process.env.WEBHOOK_BYPASS_VERIFICATION === "true") {
+    console.warn("[Webhook] ⚠️  Signature verification bypassed — disable in production");
+    return true;
+  }
+
+  if (!PARTNER_API_KEY) return false;
+
+  const rawSig =
+    req.headers["x-webhook-signature"] ||
+    req.headers["x-partner-signature"] ||
+    req.headers["x-webhook-secret"] ||
+    req.headers["x-api-key"];
+
+  const sig = Array.isArray(rawSig) ? rawSig[0] : rawSig;
+  if (!sig) return false;
+
+  // Support raw key comparison (partner sends key directly)
+  if (sig === PARTNER_API_KEY) return true;
+
+  // Support HMAC-SHA256 signature (partner sends sha256=<hex>)
+  try {
+    const expected = createHmac("sha256", PARTNER_API_KEY)
+      .update(JSON.stringify(req.body))
+      .digest("hex");
+
+    const sigHex = sig.replace(/^sha256=/, "");
+    const sigBuf = Buffer.from(sigHex, "hex");
+    const expBuf = Buffer.from(expected, "hex");
+
+    if (sigBuf.length !== expBuf.length) return false;
+    return timingSafeEqual(sigBuf, expBuf);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * ✅ Partner Webhook: Payment Status Update
+ * Payload:
+ * {
+ *   paymentId: string;
+ *   status: "success" | "failed" | "pending";
+ * }
+ */
+export const handlePaymentWebhook = asyncHandler(
+  async (req: Request, res: Response) => {
+     console.log("[Webhook] Payment webhook received:", JSON.stringify(req.body, null, 2));
+    // Never log req.headers here — the partner's shared secret is sent as a
+    // plain header value (x-api-key/x-webhook-secret), and verifyWebhookSecret
+    // hasn't run yet at this point, so logging headers would write the secret
+    // itself into the logs on every webhook call, verified or not.
+
+    if (!verifyWebhookSecret(req)) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    const { paymentId, status } = req.body;
+
+    /** ------------------ 1. Validate payload ------------------ */
+    if (!paymentId || !status) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid webhook payload",
+      });
+    }
+
+    /** ------------------ 2. Find payment by partner reference ------------------ */
+   let payment = await Payment.findOne({ paymentReference: paymentId });
+if (!payment) payment = await Payment.findOne({ transactionId: paymentId });
+
+console.log("[Webhook] Payment lookup result:", payment ? payment._id : "NOT FOUND");
+console.log("[Webhook] Searched paymentId:", paymentId);
+
+    // Always ACK partner even if we can't find the payment
+    if (!payment) {
+      console.warn(`[Webhook] Payment not found: ${paymentId}`);
+      return res.status(200).json({ received: true });
+    }
+
+    /** ------------------ 3. Idempotency guard ------------------ */
+    if (payment.status === "success" || payment.status === "failed") {
+      return res.status(200).json({ received: true });
+    }
+
+    /** ------------------ 4. Normalize status ------------------ */
+    let normalizedStatus: "pending" | "success" | "failed";
+
+    switch (status) {
+      case "success":
+      case "paid":
+        normalizedStatus = "success";
+        break;
+      case "failed":
+      case "cancelled":
+        normalizedStatus = "failed";
+        break;
+      default:
+        normalizedStatus = "pending";
+    }
+
+    /** ------------------ 5. Update Payment ------------------ */
+    payment.status = normalizedStatus;
+    payment.rawResponse = req.body;
+    await payment.save();
+
+    /** ------------------ 6. Update Order (terminal states only) ------------------ */
+    if (normalizedStatus === "success") {
+      await Order.findByIdAndUpdate(payment.orderId, {
+        paymentStatus: "paid",
+      });
+    }
+
+    if (normalizedStatus === "failed") {
+      await Order.findByIdAndUpdate(payment.orderId, {
+        paymentStatus: "failed",
+      });
+    }
+
+    /** ------------------ 7. ACK partner ------------------ */
+    return res.status(200).json({ received: true });
+  }
+);
+
+
+export const handleDeliveryWebhook = asyncHandler(
+  async (req: Request, res: Response) => {
+    if (!verifyWebhookSecret(req)) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    console.log("[DeliveryWebhook] Received:", JSON.stringify(req.body, null, 2));
+
+    const { orderId, status } = req.body;
+
+    if (!orderId || !status) {
+      return res.status(400).json({ success: false, message: "Invalid delivery webhook payload" });
+    }
+
+    const normalizedStatus = String(status).toLowerCase();
+    if (!VALID_DELIVERY_STATUSES.includes(normalizedStatus)) {
+      console.warn(`[DeliveryWebhook] Invalid status: ${status}`);
+      return res.status(400).json({ success: false, message: "Invalid status value" });
+    }
+
+    // ✅ Try partnerOrderCode first, then partnerOrderId
+   let order = await Order.findOne({ partnerOrderCode: orderId });
+if (!order) order = await Order.findOne({ partnerOrderId: orderId });
+if (!order) order = await Order.findById(orderId).catch(() => null);
+
+    if (!order) {
+      console.warn(`[DeliveryWebhook] Order not found for orderId=${orderId}`);
+      return res.status(200).json({ received: true }); // ACK anyway
+    }
+
+    order.deliveryStatus = normalizedStatus as any;
+    await order.save();
+
+    // ✅ Notify user of delivery update
+if (order.userId) {
+  try {
+    const { NotificationService } = await import("../services/NotificationService");
+    await NotificationService.notifyDeliveryUpdate(
+      order.userId.toString(),
+      order._id.toString(),
+      order.orderNumber,
+      normalizedStatus,
+    );
+  } catch (err) {
+    console.error("[DeliveryWebhook] Notification failed:", err);
+  }
+}
+
+    console.log(`[DeliveryWebhook] Order ${order._id} delivery updated to: ${normalizedStatus}`);
+    return res.status(200).json({ received: true });
+  }
+);

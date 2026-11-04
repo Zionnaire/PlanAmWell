@@ -1,0 +1,310 @@
+import { Request, Response } from "express";
+import asyncHandler from "../middleware/asyncHandler";
+import axios from "axios";
+import { Cart, ICartItem } from "../models/cart";
+import { Types } from "mongoose";
+import { User } from "../models/user";
+import { Product } from "../models/product";
+import { randomBytes } from "crypto";
+
+const PARTNER_API_URL = process.env.PARTNER_API_URL || "";
+const PARTNER_PREFIX = "/v1/PlanAmWell";
+
+// ── Resolve local drugIds → partner payload ──────────────────────────────────
+const mapCartItemForPartner = (item: ICartItem) => ({
+  drug_id: item.drugId,
+  quantity: item.quantity,
+  dosage: item.dosage || "",
+  special_instructions: item.specialInstructions || "",
+});
+
+const ensurePartnerUser = async (user: any): Promise<string | null> => {
+  if (user.partnerId) return user.partnerId;
+  try {
+    if (user.email) {
+      const searchRes = await axios.get(
+        `${PARTNER_API_URL}${PARTNER_PREFIX}/accounts/search?email=${encodeURIComponent(user.email)}`,
+      );
+      if (searchRes.data?.user?.id) {
+        user.partnerId = searchRes.data.user.id;
+        await user.save();
+        return user.partnerId;
+      }
+    }
+    const safePassword = randomBytes(12).toString("hex");
+    const createRes = await axios.post(
+      `${PARTNER_API_URL}${PARTNER_PREFIX}/accounts`,
+      {
+        name: user.name,
+        email: user.email,
+        phone: user.phone,
+        password: safePassword,
+        confirmPassword: safePassword,
+        gender: user.gender || "male",
+        dateOfBirth: user.dateOfBirth,
+        homeAddress: user.homeAddress,
+        state: user.state,
+        lga: user.lga,
+        role: "CLIENT",
+        origin: "PlanAmWell",
+        isGuest: false,
+      },
+    );
+    user.partnerId = createRes.data.user.id;
+    await user.save();
+    return user.partnerId;
+  } catch (err: any) {
+    if (err.response?.status === 409 && user.email) {
+      try {
+        const retryRes = await axios.get(
+          `${PARTNER_API_URL}${PARTNER_PREFIX}/accounts/search?email=${encodeURIComponent(user.email)}`,
+        );
+        if (retryRes.data?.user?.id) {
+          user.partnerId = retryRes.data.user.id;
+          await user.save();
+          return user.partnerId;
+        }
+      } catch (_) {}
+    }
+    console.warn(
+      "[Cart] ensurePartnerUser failed:",
+      err.response?.data || err.message,
+    );
+    return null;
+  }
+};
+
+// ── Identify cart owner ──────────────────────────────────────────────────────
+// Only trust sessionId from the signed JWT — never from request body/query params
+const getOwnerQuery = (req: Request) => {
+  if (req.auth?.id) return { userId: req.auth.id };
+  if (req.auth?.sessionId) return { sessionId: req.auth.sessionId };
+  throw new Error("No userId or sessionId provided to identify cart owner.");
+};
+
+// ── Sync cart to partner (fire-and-forget, never throws) ────────────────────
+const syncCartToPartner = async (cart: any, partnerId: string) => {
+  try {
+    const payload = {
+      userId: partnerId,
+      platform: "paw",
+      items: cart.items.map(mapCartItemForPartner),
+    };
+    const response = await axios.post(
+      `${PARTNER_API_URL}${PARTNER_PREFIX}/cart`,
+      payload,
+    );
+    const partnerCart = response.data.cart;
+    
+    if (partnerCart) {
+      // ✅ Only save the partner cart ID — never overwrite local totals
+      cart.partnerCartId = partnerCart.id;
+      await cart.save();
+    }
+    console.log("[Cart] Partner cart synced");
+  } catch (err: any) {
+    console.error("[Cart] Partner sync failed:", err.response?.data || err.message);
+  }
+};
+
+// ── ADD ITEMS TO CART ────────────────────────────────────────────────────────
+export const addToCart = asyncHandler(async (req: Request, res: Response) => {
+  const { items } = req.body as { items: ICartItem[] };
+
+  console.log("[addToCart] body:", JSON.stringify(req.body, null, 2));
+  console.log("[addToCart] auth:", req.auth);
+
+  if (!items?.length) {
+    res.status(400);
+    throw new Error("Items are required");
+  }
+
+  // ── Price/stock authority check ──────────────────────────────────────────
+  // `items` is client-supplied, including `price` — never trust that value.
+  // Re-fetch each product server-side and overwrite price with the real
+  // catalog price so a modified request can't check out at an arbitrary
+  // price. Also reject unknown drugIds and requests that exceed stock.
+  const products = await Product.find({
+    drugId: { $in: items.map((i) => i.drugId) },
+  }).lean();
+  const productByDrugId = new Map(products.map((p) => [p.drugId, p]));
+
+  const validatedItems: ICartItem[] = [];
+  for (const item of items) {
+    const product = productByDrugId.get(item.drugId);
+    if (!product) {
+      res.status(400);
+      throw new Error(`Product not found: ${item.drugId}`);
+    }
+    const quantity = Number(item.quantity);
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+      res.status(400);
+      throw new Error(`Invalid quantity for ${product.name || item.drugId}`);
+    }
+    if (product.stockQuantity < quantity) {
+      res.status(400);
+      throw new Error(`Only ${product.stockQuantity} left in stock for ${product.name}`);
+    }
+    validatedItems.push({
+      ...item,
+      quantity,
+      price: product.price,
+      drugName: product.name,
+      imageUrl: product.imageUrl || item.imageUrl,
+    });
+  }
+
+  let ownerQuery;
+  try {
+    ownerQuery = getOwnerQuery(req);
+    console.log("[addToCart] ownerQuery:", ownerQuery);
+  } catch (e: any) {
+    console.error("[addToCart] getOwnerQuery failed:", e.message);
+    res.status(400);
+    throw e;
+  }
+
+  let cart = await Cart.findOne(ownerQuery);
+  console.log("[addToCart] existing cart:", cart?._id ?? "none");
+
+  if (!cart) {
+    cart = new Cart({ ...ownerQuery, items: validatedItems, totalItems: 0, totalPrice: 0 });
+  } else {
+    for (const item of validatedItems) {
+      const idx = cart.items.findIndex((i) => i.drugId === item.drugId);
+      if (idx > -1) {
+        const newQuantity = cart.items[idx].quantity + item.quantity;
+        const product = productByDrugId.get(item.drugId)!;
+        if (product.stockQuantity < newQuantity) {
+          res.status(400);
+          throw new Error(`Only ${product.stockQuantity} left in stock for ${product.name}`);
+        }
+        cart.items[idx].quantity = newQuantity;
+        cart.items[idx].price = item.price; // re-sync in case catalog price changed
+      } else {
+        cart.items.push({ ...item });
+      }
+    }
+  }
+
+  cart.totalItems = cart.items.reduce((s, i) => s + i.quantity, 0);
+  cart.totalPrice = cart.items.reduce(
+    (s, i) => s + (i.price || 0) * i.quantity,
+    0,
+  );
+
+  try {
+    await cart.save();
+    console.log(
+      "[addToCart] cart saved ✅ id:",
+      cart._id,
+      "items:",
+      cart.items.length,
+    );
+  } catch (saveErr: any) {
+    console.error("[addToCart] cart.save() FAILED:", saveErr.message);
+    throw saveErr;
+  }
+
+  // Partner sync — only for logged-in users (guests sync at checkout)
+  if (ownerQuery.userId) {
+    const user = await User.findById(ownerQuery.userId);
+    if (user) {
+      const partnerId = await ensurePartnerUser(user);
+      if (partnerId) await syncCartToPartner(cart, partnerId);
+    }
+  }
+
+  res.status(201).json({ success: true, localCart: cart });
+});
+
+// ── GET CART ─────────────────────────────────────────────────────────────────
+// getCart in cartController.ts
+export const getCart = asyncHandler(async (req: Request, res: Response) => {
+  const ownerQuery = getOwnerQuery(req);
+  const cart = await Cart.findOne(ownerQuery);
+  if (!cart)
+    return res.status(404).json({ success: false, message: "Cart not found" });
+
+  // ✅ Match addToCart response shape so frontend reads consistently
+  res.status(200).json({ success: true, localCart: cart, data: cart });
+});
+
+// ── CLEAR CART ───────────────────────────────────────────────────────────────
+export const clearCart = asyncHandler(async (req: Request, res: Response) => {
+  const userId = req.auth?.id;
+  const sessionId = req.auth?.sessionId;
+
+  if (!userId && !sessionId) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+
+  const cartQuery: any = { $or: [] };
+  if (userId) cartQuery.$or.push({ userId: new Types.ObjectId(userId) });
+  if (sessionId) cartQuery.$or.push({ sessionId });
+
+  const cart = await Cart.findOne(cartQuery);
+  if (!cart)
+    return res
+      .status(404)
+      .json({ success: false, message: "No cart found to clear" });
+
+  await Cart.deleteMany(cartQuery);
+  return res
+    .status(200)
+    .json({ success: true, message: "Cart cleared successfully" });
+});
+
+// ── UPDATE CART ITEM ─────────────────────────────────────────────────────────
+export const updateCartItem = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { drugId, quantity, dosage, specialInstructions } = req.body;
+    if (!drugId || quantity == null) {
+      res.status(400);
+      throw new Error("drugId and quantity are required");
+    }
+
+    const ownerQuery = getOwnerQuery(req);
+    const cart = await Cart.findOne(ownerQuery);
+    if (!cart) throw new Error("Cart not found");
+
+    const idx = cart.items.findIndex((i) => i.drugId === drugId);
+    if (idx === -1) throw new Error("Item not found in cart");
+
+    cart.items[idx].quantity = quantity;
+    if (dosage !== undefined) cart.items[idx].dosage = dosage;
+    if (specialInstructions !== undefined)
+      cart.items[idx].specialInstructions = specialInstructions;
+
+    cart.totalItems = cart.items.reduce((s, i) => s + i.quantity, 0);
+    cart.totalPrice = cart.items.reduce(
+      (s, i) => s + (i.price || 0) * i.quantity,
+      0,
+    );
+    await cart.save();
+
+    res.status(200).json({ success: true, data: cart });
+  },
+);
+
+// ── REMOVE ITEM FROM CART ────────────────────────────────────────────────────
+export const removeCartItem = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { drugId } = req.body;
+    if (!drugId) throw new Error("drugId is required");
+
+    const ownerQuery = getOwnerQuery(req);
+    const cart = await Cart.findOne(ownerQuery);
+    if (!cart) throw new Error("Cart not found");
+
+    cart.items = cart.items.filter((i) => i.drugId !== drugId);
+    cart.totalItems = cart.items.reduce((s, i) => s + i.quantity, 0);
+    cart.totalPrice = cart.items.reduce(
+      (s, i) => s + (i.price || 0) * i.quantity,
+      0,
+    );
+    await cart.save();
+
+    res.status(200).json({ success: true, data: cart });
+  },
+);

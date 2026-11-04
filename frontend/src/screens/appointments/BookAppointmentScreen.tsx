@@ -1,0 +1,704 @@
+// screens/BookAppointmentScreen.tsx
+import React, { useState, useMemo, useEffect, useCallback } from "react";
+import {
+  View,
+  Text,
+  StyleSheet,
+  TextInput,
+  TouchableOpacity,
+  ScrollView,
+  Switch,
+  ActivityIndicator,
+} from "react-native";
+import Toast from "react-native-toast-message";
+import { SafeAreaView } from "react-native-safe-area-context";
+import DateTimePicker from "@react-native-community/datetimepicker";
+import { RouteProp, useRoute, useNavigation, useFocusEffect } from "@react-navigation/native";
+import { LinearGradient } from "expo-linear-gradient";
+import { Ionicons } from "@expo/vector-icons";
+import { RFValue } from "react-native-responsive-fontsize";
+
+import { AppStackParamList } from "../../types/App";
+import { IDoctor } from "../../types/backendType";
+import { CompleteProfileModal } from "../../components/profile/CompleteProfileModal";
+import { validateProfile, getBookedSlots } from "../../services/Appointment";
+import { familyMemberService, IFamilyMember } from "../../services/familyMemberService";
+import { getPlatformSettings, formatKobo } from "../../services/platformSettings";
+
+type DoctorRouteProps = RouteProp<AppStackParamList, "BookAppointmentScreen">;
+
+// ── Availability helpers ──────────────────────────────────────────────────────
+const WEEKDAY_NAMES = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+
+function getDayAvailability(
+  date: Date,
+  availability: Record<string, any> | undefined
+): { from: string; to: string; slotDuration: number } | null {
+  if (!availability) return null;
+  const name = WEEKDAY_NAMES[date.getDay()];
+  const slot = availability[name];
+  // `available` was never checked here — a day this screen's own editor
+  // toggled off still has its old from/to values sitting in the record (the
+  // editor only flips the boolean, it doesn't clear the times), so this was
+  // showing bookable slots on days the doctor marked unavailable. Checking
+  // `=== false` specifically (not just falsy) because web's editor uses a
+  // different convention — it omits a disabled day instead of writing
+  // `available: false` — so a day it considers open has no `available` key
+  // at all and must still pass here.
+  if (slot?.available === false || !slot?.from || !slot?.to) return null;
+  return { from: slot.from, to: slot.to, slotDuration: availability.slotDuration ?? 30 };
+}
+
+function generateTimeSlots(from: string, to: string, slotMin: number): string[] {
+  const [fh, fm] = from.split(":").map(Number);
+  const [th, tm] = to.split(":").map(Number);
+  const start = fh * 60 + fm;
+  const end   = th * 60 + tm;
+  const slots: string[] = [];
+  for (let t = start; t < end; t += slotMin) {
+    slots.push(`${String(Math.floor(t / 60)).padStart(2,"0")}:${String(t % 60).padStart(2,"0")}`);
+  }
+  return slots;
+}
+
+function slotToDate(base: Date, hhmm: string): Date {
+  const [h, m] = hhmm.split(":").map(Number);
+  const d = new Date(base);
+  d.setHours(h, m, 0, 0);
+  return d;
+}
+
+
+export const BookAppointmentScreen: React.FC = () => {
+  const route      = useRoute<DoctorRouteProps>();
+  const navigation = useNavigation<any>();
+
+  const doctor = route.params?.doctor as IDoctor;
+
+  const [selectedDate, setSelectedDate]     = useState<Date | null>(null);
+  const [selectedTime, setSelectedTime]     = useState<Date | null>(null);
+  const [showTimePicker, setShowTimePicker] = useState(false);
+  const [availableSlots, setAvailableSlots] = useState<string[]>([]);
+  const [selectedSlot,   setSelectedSlot]   = useState<string | null>(null);
+  const [isProceeding,  setIsProceeding]    = useState(false);
+  const [feeLabel, setFeeLabel]             = useState("...");
+
+  useEffect(() => {
+    getPlatformSettings()
+      .then((s) => setFeeLabel(formatKobo(s.consultationFeeKobo, s.currency)))
+      .catch(() => setFeeLabel("—"));
+  }, []);
+
+  // Recompute time slots whenever the selected date changes — then hide any
+  // slot another patient has already booked. The backend's unique index is
+  // the real guarantee against double-booking; this is just so a patient
+  // doesn't pick a slot only to be told it's gone at payment time.
+  useEffect(() => {
+    setSelectedSlot(null);
+    setSelectedTime(null);
+    if (!selectedDate) { setAvailableSlots([]); return; }
+    const info = getDayAvailability(selectedDate, doctor.availability);
+    if (!info) { setAvailableSlots([]); return; }
+
+    const allSlots = generateTimeSlots(info.from, info.to, info.slotDuration);
+    setAvailableSlots(allSlots);
+
+    let cancelled = false;
+    const dayStart = new Date(selectedDate);
+    dayStart.setHours(0, 0, 0, 0);
+    const dayEnd = new Date(dayStart);
+    dayEnd.setDate(dayEnd.getDate() + 1);
+
+    getBookedSlots(doctor._id, dayStart, dayEnd).then((booked) => {
+      if (cancelled || booked.length === 0) return;
+      setAvailableSlots((prev) =>
+        prev.filter((hhmm) => {
+          const slotStart = slotToDate(selectedDate, hhmm).getTime();
+          return !booked.some((b) => {
+            const bStart = new Date(b.scheduledAt).getTime();
+            const bEnd = bStart + (b.duration || 30) * 60000;
+            return slotStart >= bStart && slotStart < bEnd;
+          });
+        })
+      );
+    });
+
+    return () => { cancelled = true; };
+  }, [selectedDate]);
+  const [reason, setReason]                 = useState("");
+  const [notes, setNotes]                   = useState("");
+  const [shareUserInfo, setShareUserInfo]   = useState(true);
+
+  const [familyMembers, setFamilyMembers]   = useState<IFamilyMember[]>([]);
+  const [selectedMember, setSelectedMember] = useState<IFamilyMember | null>(null);
+
+  useFocusEffect(useCallback(() => {
+    familyMemberService.getAll().then(setFamilyMembers).catch(() => {});
+  }, []));
+
+  // ── CompleteProfileModal state ────────────────────────────────────────────
+  const [showProfileModal, setShowProfileModal]   = useState(false);
+  const [missingFields, setMissingFields]         = useState<string[]>([]);
+  // Store the pending payload so we can retry after profile is saved
+  const [pendingPayload, setPendingPayload]       = useState<{
+    scheduledAt: string;
+    reason: string;
+    notes: string;
+    shareUserInfo: boolean;
+  } | null>(null);
+
+  // 14-day mini calendar — includes availability flag per day
+  const next14Days = useMemo(() => {
+    const arr: { date: Date; day: string; dayNum: number; available: boolean }[] = [];
+    for (let i = 0; i < 14; i++) {
+      const d = new Date();
+      d.setDate(d.getDate() + i);
+      arr.push({
+        date: d,
+        day: d.toLocaleDateString("en-US", { weekday: "short" }),
+        dayNum: d.getDate(),
+        available: doctor.availability
+          ? getDayAvailability(d, doctor.availability) !== null
+          : true, // no schedule set → all days allowed (free picker)
+      });
+    }
+    return arr;
+  }, []);
+
+  // ── Core navigation to payment ────────────────────────────────────────────
+  const goToPayment = (scheduledAt: string, reason: string, notes: string, shareUserInfo: boolean) => {
+    navigation.navigate("PaymentScreen", {
+      doctor,
+      scheduledAt,
+      reason,
+      notes,
+      shareUserInfo,
+    });
+  };
+
+  // ── Attempt to proceed — may hit the profile gate ─────────────────────────
+  const attemptProceed = async (
+    scheduledAt: string,
+    reason: string,
+    notes: string,
+    shareUserInfo: boolean,
+  ) => {
+    setIsProceeding(true);
+    try {
+      // Dry-run: call the appointment endpoint early so we can surface the
+      // PROFILE_INCOMPLETE error before the user even hits payment.
+      // If your PaymentScreen creates the appointment after payment, you can
+      // remove this call and just navigate — the gate will fire there instead.
+      // If you want to keep it as a pre-flight check, keep this call.
+      await validateProfile(); // lightweight GET or HEAD — see note below
+
+      goToPayment(scheduledAt, reason, notes, shareUserInfo);
+    } catch (err: any) {
+      const data = err?.response?.data;
+
+      if (err?.response?.status === 422 && data?.code === "PROFILE_INCOMPLETE") {
+        // Save payload so we can retry after the modal saves
+        setPendingPayload({ scheduledAt, reason, notes, shareUserInfo });
+        setMissingFields(data?.missingFields ?? []);
+        setShowProfileModal(true);
+        return;
+      }
+
+      // Any other error — surface it
+      Toast.show({
+        type: "error",
+        text1: "Something went wrong",
+        text2: data?.message ?? err?.message ?? "Please try again.",
+      });
+    } finally {
+      setIsProceeding(false);
+    }
+  };
+
+  const handleProceed = () => {
+    if (isProceeding) return;
+    if (!selectedDate || !selectedTime) {
+      return Toast.show({ type: "error", text1: "Select a date and time" });
+    }
+    if (!reason.trim()) {
+      return Toast.show({ type: "error", text1: "Please provide a reason for the visit" });
+    }
+
+    const scheduledAt = new Date(
+      selectedDate.getFullYear(),
+      selectedDate.getMonth(),
+      selectedDate.getDate(),
+      selectedTime.getHours(),
+      selectedTime.getMinutes()
+    );
+
+    if (scheduledAt <= new Date()) {
+      return Toast.show({ type: "error", text1: "Please select a future date and time" });
+    }
+
+    // Compose notes — prepend family member health context when booking for someone else
+    let composedNotes = notes;
+    if (selectedMember) {
+      const parts = [`[For: ${selectedMember.name} (${selectedMember.relationship})]`];
+      if (selectedMember.bloodGroup) parts.push(`Blood: ${selectedMember.bloodGroup}`);
+      if (selectedMember.allergies) parts.push(`Allergies: ${selectedMember.allergies}`);
+      if (selectedMember.notes) parts.push(selectedMember.notes);
+      const context = parts.join(" | ");
+      composedNotes = notes ? `${context}\n${notes}` : context;
+    }
+
+    attemptProceed(scheduledAt.toISOString(), reason, composedNotes, shareUserInfo);
+  };
+
+  // ── Called after CompleteProfileModal saves successfully ──────────────────
+  const handleProfileSaved = () => {
+    setShowProfileModal(false);
+    if (pendingPayload) {
+      // Retry the navigation now that the profile is complete
+      goToPayment(
+        pendingPayload.scheduledAt,
+        pendingPayload.reason,
+        pendingPayload.notes,
+        pendingPayload.shareUserInfo,
+      );
+      setPendingPayload(null);
+    }
+  };
+
+  // Guards a nav-state edge case (deep link, stale/restored nav state,
+  // fast back-tap during a screen transition) where this screen is reached
+  // without a doctor param — every hook above must still run unconditionally,
+  // so this check has to come after them, not before.
+  if (!doctor?._id) {
+    return (
+      <SafeAreaView style={styles.screen}>
+        <View style={styles.errorContainer}>
+          <Ionicons name="alert-circle-outline" size={48} color="#D81E5B" />
+          <Text style={styles.errorText}>We couldn't find that doctor's details.</Text>
+          <TouchableOpacity style={styles.errorButton} onPress={() => navigation.goBack()}>
+            <Text style={styles.errorButtonText}>Go Back</Text>
+          </TouchableOpacity>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  return (
+    <SafeAreaView style={styles.screen}>
+      <LinearGradient colors={["#FFE2F0", "#fff"]} style={styles.headerBg} />
+
+      <ScrollView contentContainerStyle={styles.container} showsVerticalScrollIndicator={false}>
+
+        {/* Back button */}
+        <TouchableOpacity style={styles.backBtn} onPress={() => navigation.goBack()}>
+          <Ionicons name="chevron-back" size={26} color="#333" />
+        </TouchableOpacity>
+
+        <Text style={styles.title}>Book Appointment</Text>
+        <Text style={styles.subtitle}>Dr. {doctor.firstName} {doctor.lastName}</Text>
+        <Text style={styles.spec}>{doctor.specialization}</Text>
+
+        {/* ── Rate card ─────────────────────────────────────────────────── */}
+        <View style={styles.rateCard}>
+          <View style={styles.rateLeft}>
+            <Ionicons name="shield-checkmark" size={20} color="#D81E5B" />
+            <Text style={styles.rateLabel}>Consultation Fee</Text>
+          </View>
+          <Text style={styles.rateValue}>{feeLabel}</Text>
+        </View>
+
+        {/* ── Date picker ───────────────────────────────────────────────── */}
+        <Text style={styles.fieldLabel}>Select Date</Text>
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          style={styles.dateScroll}
+        >
+          {next14Days.map((d) => {
+            const selected = selectedDate?.toDateString() === d.date.toDateString();
+            return (
+              <TouchableOpacity
+                key={d.date.toDateString()}
+                style={[
+                  styles.datePill,
+                  selected && styles.datePillActive,
+                  !d.available && styles.datePillUnavailable,
+                ]}
+                onPress={() => {
+                  if (!d.available) {
+                    Toast.show({ type: "info", text1: "Doctor unavailable", text2: "No slots on this day." });
+                    return;
+                  }
+                  setSelectedDate(d.date);
+                }}
+              >
+                <Text style={[styles.dateDay, selected && styles.dateTextActive, !d.available && styles.dateTextUnavailable]}>{d.day}</Text>
+                <Text style={[styles.dateNum, selected && styles.dateTextActive, !d.available && styles.dateTextUnavailable]}>{d.dayNum}</Text>
+                {!d.available && <Text style={styles.datePillDash}>—</Text>}
+              </TouchableOpacity>
+            );
+          })}
+        </ScrollView>
+
+        {/* ── Time picker ───────────────────────────────────────────────── */}
+        <Text style={styles.fieldLabel}>Select Time</Text>
+
+        {availableSlots.length > 0 ? (
+          /* Slot grid — shown when doctor has set availability for this day */
+          <>
+            <View style={styles.slotGrid}>
+              {availableSlots.map((slot) => {
+                const active = selectedSlot === slot;
+                return (
+                  <TouchableOpacity
+                    key={slot}
+                    style={[styles.slotPill, active && styles.slotPillActive]}
+                    onPress={() => {
+                      setSelectedSlot(slot);
+                      setSelectedTime(slotToDate(selectedDate!, slot));
+                    }}
+                  >
+                    <Text style={[styles.slotText, active && styles.slotTextActive]}>{slot}</Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+            {!selectedSlot && (
+              <Text style={styles.slotHint}>Tap a slot to select your appointment time</Text>
+            )}
+          </>
+        ) : (
+          /* Free picker — shown when no schedule is set or date not selected */
+          <>
+            <TouchableOpacity style={styles.timeBtn} onPress={() => setShowTimePicker(true)}>
+              <Ionicons name="time-outline" size={20} color="#D81E5B" />
+              <Text style={styles.timeBtnText}>
+                {selectedTime
+                  ? selectedTime.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+                  : "Tap to choose time"}
+              </Text>
+            </TouchableOpacity>
+            {showTimePicker && (
+              <DateTimePicker
+                value={selectedTime || new Date()}
+                mode="time"
+                onChange={(_, time) => {
+                  setShowTimePicker(false);
+                  if (time) setSelectedTime(time);
+                }}
+              />
+            )}
+          </>
+        )}
+
+        {/* ── Who is this appointment for? ──────────────────────────────── */}
+        {familyMembers.length > 0 && (
+          <>
+            <Text style={styles.fieldLabel}>Who is this for?</Text>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 20 }}>
+              {/* Myself chip */}
+              <TouchableOpacity
+                style={[styles.forChip, selectedMember === null && styles.forChipActive]}
+                onPress={() => setSelectedMember(null)}
+              >
+                <Ionicons name="person" size={14} color={selectedMember === null ? "#fff" : "#555"} />
+                <Text style={[styles.forChipText, selectedMember === null && styles.forChipTextActive]}>Myself</Text>
+              </TouchableOpacity>
+              {familyMembers.map(m => (
+                <TouchableOpacity
+                  key={m._id}
+                  style={[styles.forChip, selectedMember?._id === m._id && styles.forChipActive]}
+                  onPress={() => setSelectedMember(m)}
+                >
+                  <Ionicons name="people" size={14} color={selectedMember?._id === m._id ? "#fff" : "#555"} />
+                  <Text style={[styles.forChipText, selectedMember?._id === m._id && styles.forChipTextActive]}>
+                    {m.name.split(" ")[0]}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
+          </>
+        )}
+
+        {/* ── Reason ────────────────────────────────────────────────────── */}
+        <Text style={styles.fieldLabel}>Reason for Visit</Text>
+        <TextInput
+          style={styles.input}
+          placeholder="Describe your symptoms or concern…"
+          placeholderTextColor="#AAA"
+          value={reason}
+          onChangeText={setReason}
+          multiline
+          numberOfLines={3}
+        />
+
+        {/* ── Notes ─────────────────────────────────────────────────────── */}
+        <Text style={styles.fieldLabel}>Additional Notes <Text style={styles.optional}>(optional)</Text></Text>
+        <TextInput
+          style={styles.input}
+          placeholder="Any other information for the doctor…"
+          placeholderTextColor="#AAA"
+          value={notes}
+          onChangeText={setNotes}
+          multiline
+        />
+
+        {/* ── Share info toggle ─────────────────────────────────────────── */}
+        <View style={styles.shareRow}>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.shareTitle}>Share my profile with doctor</Text>
+            <Text style={styles.shareSubtitle}>Name, email, phone, and health info</Text>
+          </View>
+          <Switch
+            value={shareUserInfo}
+            onValueChange={setShareUserInfo}
+            trackColor={{ true: "#D81E5B", false: "#ccc" }}
+            thumbColor="#fff"
+          />
+        </View>
+
+        {/* ── Summary ───────────────────────────────────────────────────── */}
+        <View style={styles.summaryCard}>
+          <Text style={styles.summaryTitle}>Booking Summary</Text>
+          <Row icon="person" label="Doctor" value={`Dr. ${doctor.firstName} ${doctor.lastName}`} />
+          <Row icon="calendar" label="Date" value={selectedDate
+            ? selectedDate.toLocaleDateString("en-US", { weekday: "long", day: "numeric", month: "long" })
+            : "Not selected"} />
+          <Row icon="time" label="Time" value={selectedTime
+            ? selectedTime.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+            : "Not selected"} />
+          <Row icon="cash" label="Fee" value={feeLabel} highlight />
+        </View>
+
+        {/* ── CTA ───────────────────────────────────────────────────────── */}
+        <TouchableOpacity
+          style={[styles.proceedBtn, isProceeding && { opacity: 0.7 }]}
+          onPress={handleProceed}
+          activeOpacity={0.85}
+          disabled={isProceeding}
+        >
+          {isProceeding ? (
+            <ActivityIndicator color="#fff" style={{ marginRight: 8 }} />
+          ) : (
+            <Ionicons name="lock-closed" size={18} color="#fff" style={{ marginRight: 8 }} />
+          )}
+          <Text style={styles.proceedBtnText}>Proceed to Payment</Text>
+        </TouchableOpacity>
+
+        <Text style={styles.disclaimer}>
+          Payment is required to confirm your booking. You will only be charged once the appointment is accepted by the doctor.
+        </Text>
+
+      </ScrollView>
+
+      {/* ── Complete Profile Modal ─────────────────────────────────────── */}
+      <CompleteProfileModal
+        visible={showProfileModal}
+        missingFields={missingFields}
+        onClose={() => {
+          setShowProfileModal(false);
+          setPendingPayload(null);
+        }}
+        onSaved={handleProfileSaved}
+      />
+    </SafeAreaView>
+  );
+};
+
+// ── Small helper component ────────────────────────────────────────────────────
+const Row = ({
+  icon, label, value, highlight,
+}: {
+  icon: string; label: string; value: string; highlight?: boolean;
+}) => (
+  <View style={styles.summaryRow}>
+    <Ionicons name={icon as any} size={16} color="#888" />
+    <Text style={styles.summaryLabel}>{label}</Text>
+    <Text style={[styles.summaryValue, highlight && { color: "#D81E5B", fontWeight: "700" }]}>
+      {value}
+    </Text>
+  </View>
+);
+
+const styles = StyleSheet.create({
+  screen:    { flex: 1, backgroundColor: "#fff" },
+  headerBg:  { position: "absolute", top: 0, width: "100%", height: 200 },
+  container: { padding: 20, paddingTop: 16, paddingBottom: 40 },
+
+  errorContainer: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24 },
+  errorText: { fontSize: RFValue(15), color: "#444", textAlign: "center", marginTop: 12, marginBottom: 20 },
+  errorButton: { backgroundColor: "#D81E5B", paddingHorizontal: 24, paddingVertical: 12, borderRadius: 24 },
+  errorButtonText: { color: "#fff", fontWeight: "700", fontSize: RFValue(14) },
+
+  backBtn: { marginBottom: 12 },
+  title:   { fontSize: RFValue(26), fontWeight: "800", color: "#222", marginBottom: 4 },
+  subtitle:{ fontSize: RFValue(16), fontWeight: "600", color: "#444" },
+  spec:    { fontSize: RFValue(13), color: "#888", marginBottom: 20 },
+
+  // Rate card
+  rateCard: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    backgroundColor: "#FFF0F6",
+    borderWidth: 1,
+    borderColor: "#F9A8C9",
+    borderRadius: 14,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    marginBottom: 24,
+  },
+  rateLeft:  { flexDirection: "row", alignItems: "center", gap: 8 },
+  rateLabel: { fontSize: RFValue(14), fontWeight: "600", color: "#444" },
+  rateValue: { fontSize: RFValue(18), fontWeight: "800", color: "#D81E5B" },
+
+  fieldLabel: {
+    fontSize: RFValue(13),
+    fontWeight: "700",
+    color: "#555",
+    marginBottom: 10,
+    marginTop: 4,
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+  },
+  optional: { fontWeight: "400", color: "#AAA" },
+
+  // Date
+  dateScroll: { marginBottom: 20 },
+  datePill: {
+    width: 58,
+    height: 70,
+    borderRadius: 14,
+    backgroundColor: "#F5F5F5",
+    marginRight: 10,
+    justifyContent: "center",
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "#EEE",
+  },
+  datePillActive:      { backgroundColor: "#D81E5B", borderColor: "#D81E5B" },
+  datePillUnavailable: { backgroundColor: "#F5F5F5", borderColor: "#E0E0E0", opacity: 0.5 },
+  dateDay:             { fontSize: RFValue(11), color: "#777" },
+  dateNum:             { fontSize: RFValue(18), fontWeight: "700", color: "#222", marginTop: 2 },
+  dateTextActive:      { color: "#fff" },
+  dateTextUnavailable: { color: "#CCC" },
+  datePillDash:        { fontSize: RFValue(10), color: "#CCC", marginTop: 2 },
+
+  // Slot grid
+  slotGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 10,
+    marginBottom: 8,
+  },
+  slotPill: {
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+    borderRadius: 20,
+    borderWidth: 1.5,
+    borderColor: "#E0E0E0",
+    backgroundColor: "#FAFAFA",
+  },
+  slotPillActive: {
+    backgroundColor: "#D81E5B",
+    borderColor: "#D81E5B",
+  },
+  slotText:       { fontSize: RFValue(13), fontWeight: "600", color: "#444" },
+  slotTextActive: { color: "#FFF" },
+  slotHint: {
+    fontSize: RFValue(12),
+    color: "#AAA",
+    marginBottom: 20,
+    fontStyle: "italic",
+  },
+
+  // Time
+  timeBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    borderWidth: 1,
+    borderColor: "#E0E0E0",
+    borderRadius: 14,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    marginBottom: 20,
+    backgroundColor: "#FAFAFA",
+  },
+  timeBtnText: { fontSize: RFValue(15), color: "#333" },
+
+  // Inputs
+  input: {
+    borderWidth: 1,
+    borderColor: "#E0E0E0",
+    borderRadius: 14,
+    padding: 14,
+    fontSize: RFValue(14),
+    color: "#333",
+    backgroundColor: "#FAFAFA",
+    marginBottom: 20,
+    minHeight: 60,
+    textAlignVertical: "top",
+  },
+
+  // Share row
+  shareRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#F9F9F9",
+    borderRadius: 14,
+    padding: 16,
+    marginBottom: 24,
+    gap: 12,
+  },
+  shareTitle:    { fontSize: RFValue(14), fontWeight: "600", color: "#333" },
+  shareSubtitle: { fontSize: RFValue(12), color: "#999", marginTop: 2 },
+
+  // Summary card
+  summaryCard: {
+    backgroundColor: "#F9F9F9",
+    borderRadius: 16,
+    padding: 18,
+    marginBottom: 24,
+    gap: 12,
+  },
+  summaryTitle: { fontSize: RFValue(14), fontWeight: "700", color: "#222", marginBottom: 4 },
+  summaryRow:   { flexDirection: "row", alignItems: "center", gap: 8 },
+  summaryLabel: { fontSize: RFValue(13), color: "#888", flex: 1 },
+  summaryValue: { fontSize: RFValue(13), color: "#333", fontWeight: "600" },
+
+  // CTA
+  proceedBtn: {
+    backgroundColor: "#D81E5B",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 16,
+    borderRadius: 20,
+    marginBottom: 16,
+    shadowColor: "#D81E5B",
+    shadowOpacity: 0.3,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 4,
+  },
+  proceedBtnText: { color: "#fff", fontSize: RFValue(16), fontWeight: "700" },
+  disclaimer:     { fontSize: RFValue(11), color: "#AAA", textAlign: "center", lineHeight: 16 },
+
+  // "Who is this for?" chips
+  forChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+    borderRadius: 20,
+    borderWidth: 1.5,
+    borderColor: "#E0E0E0",
+    backgroundColor: "#FAFAFA",
+    marginRight: 8,
+  },
+  forChipActive:     { backgroundColor: "#D81E5B", borderColor: "#D81E5B" },
+  forChipText:       { fontSize: RFValue(13), fontWeight: "600", color: "#555" },
+  forChipTextActive: { color: "#FFF" },
+});

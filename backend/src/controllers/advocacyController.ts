@@ -1,0 +1,550 @@
+// controllers/advocacyController.ts
+import { Request, Response } from "express";
+import { AdvocacyArticle } from "../models/advocacy";
+import { Comment } from "../models/comment";
+import asyncHandler from "../middleware/asyncHandler";
+import { uploadToCloudinary } from "../middleware/claudinary";
+import { memoryCache } from "../util/memoryCache";
+
+import slugify from "slugify";
+
+const ADVOCACY_CACHE_PREFIX = "advocacy:";
+const ADVOCACY_CACHE_TTL_MS = 10 * 60 * 1000; // 10 min — write paths below invalidate immediately anyway
+
+// =====================================================
+// PUBLIC ROUTES (No Authentication Required)
+// =====================================================
+
+// GET /api/v1/advocacy - Get all published articles with filters
+export const getArticles = asyncHandler(async (req: Request, res: Response) => {
+  const {
+    category,
+    tag,
+    featured,
+    search,
+    page = 1,
+    limit = 10,
+    sort = "-publishedAt",
+  } = req.query;
+
+  // Build query
+  const query: any = { status: "published" };
+
+  if (category) query.category = category;
+  if (tag) query.tags = { $in: [tag] };
+  if (featured === "true") query.featured = true;
+  if (search) {
+    query.$text = { $search: search as string };
+  }
+
+  // Calculate pagination
+  const pageNum = parseInt(page as string, 10);
+  const limitNum = parseInt(limit as string, 10);
+  const skip = (pageNum - 1) * limitNum;
+
+  // Cache keyed on the full filter/pagination combo — different filters need
+  // different cached results, so the key has to reflect every input.
+  const cacheKey = `${ADVOCACY_CACHE_PREFIX}list:${JSON.stringify({ category, tag, featured, search, pageNum, limitNum, sort })}`;
+
+  const { articles, total } = await memoryCache.getOrSet(cacheKey, ADVOCACY_CACHE_TTL_MS, async () => {
+    const articles = await AdvocacyArticle.find(query)
+      .select("-content") // Exclude full content for list view
+      .sort(sort as string)
+      .skip(skip)
+      .limit(limitNum)
+      .lean();
+
+    const total = await AdvocacyArticle.countDocuments(query);
+    return { articles, total };
+  });
+
+  res.status(200).json({
+    success: true,
+    data: articles,
+    pagination: {
+      page: pageNum,
+      limit: limitNum,
+      total,
+      pages: Math.ceil(total / limitNum),
+    },
+  });
+});
+
+// GET /api/v1/advocacy/recent - Get recent articles
+export const getRecentArticles = asyncHandler(async (req: Request, res: Response) => {
+  const { limit = 5 } = req.query;
+
+  const articles = await memoryCache.getOrSet(
+    `${ADVOCACY_CACHE_PREFIX}recent:${limit}`,
+    ADVOCACY_CACHE_TTL_MS,
+    () =>
+      AdvocacyArticle.find({ status: "published" })
+        .select("-content")
+        .sort("-publishedAt")
+        .limit(parseInt(limit as string, 10))
+        .lean()
+  );
+
+  res.status(200).json({
+    success: true,
+    data: articles,
+  });
+});
+
+// GET /api/v1/advocacy/featured - Get featured articles
+export const getFeaturedArticles = asyncHandler(async (req: Request, res: Response) => {
+  const { limit = 3 } = req.query;
+
+  const articles = await memoryCache.getOrSet(
+    `${ADVOCACY_CACHE_PREFIX}featured:${limit}`,
+    ADVOCACY_CACHE_TTL_MS,
+    () =>
+      AdvocacyArticle.find({
+        status: "published",
+        featured: true,
+      })
+        .select("-content")
+        .sort("-publishedAt")
+        .limit(parseInt(limit as string, 10))
+        .lean()
+  );
+
+  res.status(200).json({
+    success: true,
+    data: articles,
+  });
+});
+
+// GET /api/v1/advocacy/categories - Get all categories with counts
+export const getCategories = asyncHandler(async (req: Request, res: Response) => {
+  const categories = await AdvocacyArticle.aggregate([
+    { $match: { status: "published" } },
+    {
+      $group: {
+        _id: "$category",
+        count: { $sum: 1 },
+      },
+    },
+    {
+      $project: {
+        category: "$_id",
+        count: 1,
+        _id: 0,
+      },
+    },
+  ]);
+
+  res.status(200).json({
+    success: true,
+    data: categories,
+  });
+});
+
+// GET /api/v1/advocacy/tags - Get all tags
+export const getTags = asyncHandler(async (req: Request, res: Response) => {
+  const tags = await AdvocacyArticle.aggregate([
+    { $match: { status: "published" } },
+    { $unwind: "$tags" },
+    {
+      $group: {
+        _id: "$tags",
+        count: { $sum: 1 },
+      },
+    },
+    {
+      $project: {
+        tag: "$_id",
+        count: 1,
+        _id: 0,
+      },
+    },
+    { $sort: { count: -1 } },
+  ]);
+
+  res.status(200).json({
+    success: true,
+    data: tags,
+  });
+});
+
+// GET /api/v1/advocacy/:slug - Get single article by slug
+export const getArticleBySlug = asyncHandler(async (req: Request, res: Response) => {
+  const { slug } = req.params;
+
+  const article = await AdvocacyArticle.findOne({
+    slug,
+    status: "published",
+  }).populate("relatedArticles", "title slug excerpt featuredImage category");
+
+  if (!article) {
+    return res.status(404).json({
+      success: false,
+      message: "Article not found",
+    });
+  }
+
+  // Increment views — atomic update, not .save() on this populated doc (see
+  // the golden rule documented in videoCallController.ts), and $inc also
+  // avoids a lost-update race under concurrent viewers.
+  await AdvocacyArticle.updateOne({ _id: article._id }, { $inc: { views: 1 } });
+  article.views += 1; // reflect in the response we're about to send
+
+  res.status(200).json({
+    success: true,
+    data: article,
+  });
+});
+
+// GET /api/v1/advocacy/search - Advanced search
+export const searchArticles = asyncHandler(async (req: Request, res: Response) => {
+  const { q, category, tags, page = 1, limit = 10 } = req.query;
+
+  if (!q) {
+    return res.status(400).json({
+      success: false,
+      message: "Search query is required",
+    });
+  }
+
+  const query: any = {
+    status: "published",
+    $text: { $search: q as string },
+  };
+
+  if (category) query.category = category;
+  if (tags) {
+    const tagArray = (tags as string).split(",");
+    query.tags = { $in: tagArray };
+  }
+
+  const pageNum = parseInt(page as string, 10);
+  const limitNum = parseInt(limit as string, 10);
+  const skip = (pageNum - 1) * limitNum;
+
+  const articles = await AdvocacyArticle.find(query, {
+    score: { $meta: "textScore" },
+  })
+    .select("-content")
+    .sort({ score: { $meta: "textScore" } })
+    .skip(skip)
+    .limit(limitNum)
+    .lean();
+
+  const total = await AdvocacyArticle.countDocuments(query);
+
+  res.status(200).json({
+    success: true,
+    data: articles,
+    pagination: {
+      page: pageNum,
+      limit: limitNum,
+      total,
+      pages: Math.ceil(total / limitNum),
+    },
+  });
+});
+
+// POST /api/v1/advocacy/:id/like - Like an article
+export const likeArticle = asyncHandler(async (req: Request, res: Response) => {
+  const { id } = req.params;
+
+  const article = await AdvocacyArticle.findByIdAndUpdate(
+    id,
+    { $inc: { likes: 1 } },
+    { new: true }
+  ).select("likes");
+
+  if (!article) {
+    return res.status(404).json({
+      success: false,
+      message: "Article not found",
+    });
+  }
+
+  res.status(200).json({
+    success: true,
+    data: { likes: article.likes },
+  });
+});
+
+// =====================================================
+// ADMIN ROUTES (Authentication & Authorization Required)
+// =====================================================
+
+// POST /api/v1/advocacy/admin - Create new article (with partner)
+
+// =========================
+// CREATE ARTICLE
+// =========================
+export const createArticle = asyncHandler(async (req: Request, res: Response) => {
+  const {
+    title,
+    excerpt,
+    content,
+    category,
+    tags,
+    author,
+    slug,
+    status,
+    featured,
+    metadata,
+    partner,
+  } = req.body;
+
+  let featuredImageUrl: string | undefined;
+
+  // Upload image to Cloudinary if a file is present
+  if (req.file?.buffer) {
+    try {
+      const uploadResult = await uploadToCloudinary(req.file.buffer, "articles");
+      featuredImageUrl = uploadResult.secure_url;
+    } catch (error) {
+      console.error("Cloudinary upload error:", error);
+      return res.status(500).json({
+        success: false,
+        message: "Failed to upload featured image",
+      });
+    }
+  }
+
+  const articleSlug = slug || slugify(title, { lower: true, strict: true });
+
+  // Parse author if it's a JSON string
+  const parsedAuthor = typeof author === "string" ? JSON.parse(author) : author;
+
+  // Ensure tags is an array
+  const parsedTags = typeof tags === "string" ? tags.split(",").map((t) => t.trim()) : tags;
+
+  const article = await AdvocacyArticle.create({
+    title,
+    excerpt,
+    slug: articleSlug || `article-${Date.now()}`,
+    content,
+    category,
+    tags: parsedTags,
+    author: parsedAuthor,
+    featuredImage: featuredImageUrl ? { url: featuredImageUrl } : undefined,
+    status: status || "draft",
+    featured: featured || false,
+    metadata,
+    partner,
+  });
+
+  memoryCache.invalidatePrefix(ADVOCACY_CACHE_PREFIX);
+
+  res.status(201).json({
+    success: true,
+    message: "Article created successfully",
+    data: article,
+  });
+});
+
+// =========================
+// UPDATE ARTICLE
+// =========================
+export const updateArticle = asyncHandler(async (req: Request, res: Response) => {
+  const id = req.params.id;
+
+  const ALLOWED_ARTICLE_FIELDS = [
+    "title", "excerpt", "content", "category", "tags",
+    "author", "slug", "status", "featured", "metadata",
+    "partner", "relatedArticles", "commentsEnabled",
+  ];
+  const VALID_ARTICLE_STATUSES = ["draft", "published", "archived"];
+
+  if (req.body.status && !VALID_ARTICLE_STATUSES.includes(req.body.status)) {
+    return res.status(400).json({ success: false, message: "Invalid article status" });
+  }
+
+  const updatePayload: any = {};
+  for (const key of ALLOWED_ARTICLE_FIELDS) {
+    if (req.body[key] !== undefined) updatePayload[key] = req.body[key];
+  }
+
+  // Upload new image to Cloudinary if present
+  if (req.file?.buffer) {
+    try {
+      const uploadResult = await uploadToCloudinary(req.file.buffer, "articles");
+      updatePayload.featuredImage = { url: uploadResult.secure_url };
+    } catch (error) {
+      console.error("Cloudinary upload error:", error);
+      return res.status(500).json({
+        success: false,
+        message: "Failed to upload featured image",
+      });
+    }
+  }
+
+  // Parse author if sent as JSON string
+  if (updatePayload.author && typeof updatePayload.author === "string") {
+    updatePayload.author = JSON.parse(updatePayload.author);
+  }
+
+  // Ensure tags is an array
+  if (updatePayload.tags && typeof updatePayload.tags === "string") {
+    updatePayload.tags = updatePayload.tags.split(",").map((t: string) => t.trim());
+  }
+
+  const article = await AdvocacyArticle.findByIdAndUpdate(id, updatePayload, {
+    new: true,
+    runValidators: true,
+  });
+
+  if (!article) {
+    res.status(404);
+    throw new Error("Article not found");
+  }
+
+  memoryCache.invalidatePrefix(ADVOCACY_CACHE_PREFIX);
+
+  res.status(200).json({
+    success: true,
+    message: "Article updated successfully",
+    data: article,
+  });
+});
+
+
+// DELETE /api/v1/advocacy/admin/:id - Delete article
+export const deleteArticle = asyncHandler(async (req: Request, res: Response) => {
+  const { id } = req.params;
+
+  const article = await AdvocacyArticle.findByIdAndDelete(id);
+
+  if (!article) {
+    return res.status(404).json({
+      success: false,
+      message: "Article not found",
+    });
+  }
+
+  memoryCache.invalidatePrefix(ADVOCACY_CACHE_PREFIX);
+
+  res.status(200).json({
+    success: true,
+    message: "Article deleted successfully",
+  });
+});
+
+// GET /api/v1/advocacy/admin/all - Get all articles (including drafts)
+export const getAllArticlesAdmin = asyncHandler(async (req: Request, res: Response) => {
+  const { status, category, page = 1, limit = 20 } = req.query;
+
+  const query: any = {};
+  if (status) query.status = status;
+  if (category) query.category = category;
+
+  const pageNum = parseInt(page as string, 10);
+  const limitNum = parseInt(limit as string, 10);
+  const skip = (pageNum - 1) * limitNum;
+
+  const articles = await AdvocacyArticle.find(query)
+    .sort("-createdAt")
+    .skip(skip)
+    .limit(limitNum)
+    .lean();
+
+  const total = await AdvocacyArticle.countDocuments(query);
+
+  res.status(200).json({
+    success: true,
+    data: articles,
+    pagination: {
+      page: pageNum,
+      limit: limitNum,
+      total,
+      pages: Math.ceil(total / limitNum),
+    },
+  });
+});
+
+// GET /api/v1/advocacy/admin/stats - Get advocacy statistics
+export const getAdvocacyStats = asyncHandler(async (req: Request, res: Response) => {
+  const [totalArticles, publishedArticles, draftArticles, totalViews, totalLikes] =
+    await Promise.all([
+      AdvocacyArticle.countDocuments(),
+      AdvocacyArticle.countDocuments({ status: "published" }),
+      AdvocacyArticle.countDocuments({ status: "draft" }),
+      AdvocacyArticle.aggregate([
+        { $group: { _id: null, total: { $sum: "$views" } } },
+      ]).then((result) => result[0]?.total || 0),
+      AdvocacyArticle.aggregate([
+        { $group: { _id: null, total: { $sum: "$likes" } } },
+      ]).then((result) => result[0]?.total || 0),
+    ]);
+
+  const categoryStats = await AdvocacyArticle.aggregate([
+    {
+      $group: {
+        _id: "$category",
+        count: { $sum: 1 },
+        views: { $sum: "$views" },
+        likes: { $sum: "$likes" },
+      },
+    },
+  ]);
+
+  res.status(200).json({
+    success: true,
+    data: {
+      totalArticles,
+      publishedArticles,
+      draftArticles,
+      totalViews,
+      totalLikes,
+      categoryStats,
+    },
+  });
+});
+
+// Get /api/v1/advocacy/:id/stats - Get an article's statistics
+export const getArticleStats = asyncHandler(async (req: Request, res: Response) => {
+  const { id } = req.params;
+
+  const article = await AdvocacyArticle.findById(id)
+    .select(
+      "title views likes shares partner category tags referrers dailyViews topCountries topDevices"
+    )
+    .lean();
+
+  if (!article) {
+    return res.status(404).json({
+      success: false,
+      message: "Article not found",
+    });
+  }
+
+  // 👉 Fetch comments
+ const comments = await Comment.find({
+  articleId: id,
+  parentCommentId: null,
+})
+  .sort({ createdAt: -1 })
+  .populate("author.userId", "name email")
+  .lean();
+
+const formattedComments = comments.map((c) => ({
+  _id: c._id.toString(),
+  content: c.content,
+  likes: c.likes,
+  status: c.status,               // ✅ Include status
+  flagReason: c.status === "flagged" ? c.flagReason : undefined, // ✅ optional
+  createdAt: c.createdAt,
+  author: {
+    name: c.author?.name,
+    email: c.author?.email,
+    userId: c.author?.userId?.toString(),
+  },
+}));
+
+  res.status(200).json({
+    success: true,
+    data: {
+      article: {
+        ...article,
+        comments: formattedComments,
+        commentCount: formattedComments.length,
+      },
+    },
+  });
+});

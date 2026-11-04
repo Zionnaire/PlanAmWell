@@ -1,0 +1,126 @@
+import { ExpoConfig } from '@expo/config-types';
+
+const config: ExpoConfig = {
+  name: 'PlanAmWell',
+  slug: 'PlanAmWell',
+  version: '1.0.0',
+  orientation: 'portrait',
+  scheme: 'planamwell',
+  runtimeVersion: { policy: 'sdkVersion' },
+  icon: './src/assets/plan.png',
+  userInterfaceStyle: 'light',
+updates: {
+  url: "https://u.expo.dev/b17d8d1f-7620-4a54-9baa-9166dc7a27ea",
+  fallbackToCacheTimeout: 3000, // wait up to 3s for fresh update before falling back
+  checkAutomatically: 'ON_LOAD',
+},
+
+plugins: [
+      "expo-router",
+  'expo-asset',
+  [
+    'expo-notifications',
+    {
+      icon: './src/assets/plan.png',
+      color: '#D81E5B',
+      // Bundled into android/app/src/main/res/raw as "incoming_call" (no
+      // extension) — referenced by that name from both the expo-notifications
+      // channel setup and notifee's channel setup, so the ring sound is
+      // consistent and works fully offline (no third-party CDN dependency).
+      sounds: ['./src/assets/sounds/incoming_call.wav'],
+    },
+  ],
+  '@react-native-firebase/app',
+  '@react-native-firebase/messaging',
+  '@react-native-firebase/analytics',
+  './src/plugins/withCallNotifications',
+  [
+    'expo-location',
+    {
+      locationWhenInUsePermission: 'Allow PlanAmWell to use your location to find clinics near you.',
+    },
+  ],
+  [
+    'expo-build-properties',
+    {
+      android: {
+        enableProguardInReleaseBuilds: true,
+      },
+      // Firebase's iOS SDK needs static frameworks to avoid CocoaPods
+      // conflicts — required once @react-native-firebase/* is linked,
+      // even though Phase 1's iOS notifications don't call it directly yet.
+      ios: {
+        useFrameworks: 'static',
+      },
+    },
+  ],
+],
+  splash: {
+    image: './src/assets/plan.png',
+    resizeMode: 'contain',
+    backgroundColor: '#ffffff',
+  },
+  ios: {
+    bundleIdentifier: 'com.planamwell.bundle',
+    supportsTablet: true,
+    infoPlist: {
+      NSCameraUsageDescription: 'Access camera for video calls',
+      NSMicrophoneUsageDescription: 'Access microphone for video calls',
+      NSLocationWhenInUseUsageDescription: 'Allow PlanAmWell to use your location to find clinics near you.',
+      // ✅ Required for universal links
+      CFBundleURLTypes: [
+        {
+          CFBundleURLSchemes: ['planamwell'],
+        },
+      ],
+      AssociatedDomains: [
+        'applinks:planamwell.com', 
+      ],
+    },
+  },
+  android: {
+    package: 'com.planamwell.bundle',
+    googleServicesFile: './google-services.json',
+    permissions: [
+      'NOTIFICATIONS',
+      'VIBRATE',
+      'CAMERA',
+      'RECORD_AUDIO',
+      'INTERNET',
+      'MODIFY_AUDIO_SETTINGS',
+      'ACCESS_NETWORK_STATE',
+      'BLUETOOTH',
+      'ACCESS_WIFI_STATE',
+      'ACCESS_FINE_LOCATION',
+      'ACCESS_COARSE_LOCATION',
+    ],
+    jsEngine: 'hermes',
+    adaptiveIcon: {
+      foregroundImage: './src/assets/plan.png',
+      backgroundColor: '#ffffff',
+    },
+    intentFilters: [
+      {
+        action: 'VIEW',
+        data: [
+          {
+            scheme: 'https',
+            host: 'planamwell.com',
+            pathPrefix: '/',
+          },
+        ],
+        category: ['BROWSABLE', 'DEFAULT'],
+      },
+    ],
+  },
+  web: { favicon: './src/assets/plan.png' },
+  extra: {
+    eas: { projectId: 'b17d8d1f-7620-4a54-9baa-9166dc7a27ea' },
+    serverUrl: process.env.EXPO_PUBLIC_SERVER_URL,
+    googleWebClientId: process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID,
+    iosClientId: process.env.EXPO_PUBLIC_IOS_CLIENT_ID,
+    androidClientId: process.env.EXPO_PUBLIC_ANDROID_CLIENT_ID,
+  },
+};
+
+export default config;

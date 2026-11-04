@@ -1,0 +1,537 @@
+// services/Auth.ts - FIXED VERSION WITH PROPER EXPIRY HANDLING
+import axios, { AxiosResponse, AxiosError, InternalAxiosRequestConfig } from 'axios';
+import * as SecureStore from 'expo-secure-store';
+import { jwtDecode } from 'jwt-decode';
+import { UserData, AuthResponse } from '../types/Auth';
+import { AuthEntity } from '../types/backendType';
+
+// Define the base URL using the environment variable
+const SERVER_URL = process.env.EXPO_PUBLIC_SERVER_URL;
+const BASE_URL = `${SERVER_URL}/api/v1/auth`; 
+
+if (!SERVER_URL) {
+  console.error("SERVER_URL environment variable is not set!");
+}
+
+// ---------------------------------------------------------------------
+// Storage Keys
+// ---------------------------------------------------------------------
+export const TOKEN_KEY = 'Token';
+export const REFRESH_TOKEN_KEY = 'RefreshToken';
+export const SESSION_ID_KEY = 'sessionId';
+export const IS_ANONYMOUS_KEY = 'isAnonymous';
+
+// ---------------------------------------------------------------------
+// Auth Response Interfaces
+// ---------------------------------------------------------------------
+interface AuthResponseData {
+    token: string;
+    user: AuthEntity;
+    message: string;
+    refreshToken?: string;
+}
+
+interface GenericAPIResponse<T> {
+    success: boolean;
+    data?: T;
+}
+
+interface DecodedToken {
+  id: string;
+  role: string;
+  name: string;
+  exp: number;
+  iat: number;
+}
+
+// ---------------------------------------------------------------------
+// Token Management
+// ---------------------------------------------------------------------
+
+/**
+ * Check if token is expired or will expire in next 5 minutes
+ */
+const isTokenExpired = (token: string): boolean => {
+  try {
+    const decoded = jwtDecode<DecodedToken>(token);
+    const currentTime = Date.now() / 1000;
+    const bufferTime = 10 * 60; // ✅ INCREASED: 10 minutes buffer (was 5)
+    
+    const willExpire = decoded.exp < (currentTime + bufferTime);
+    
+    if (willExpire) {
+      console.log('[Auth] Token will expire soon or is expired');
+      console.log('[Auth] Expires at:', new Date(decoded.exp * 1000).toISOString());
+      console.log('[Auth] Current time:', new Date().toISOString());
+    }
+    
+    return willExpire;
+  } catch (error) {
+    console.error('[Auth] Error decoding token:', error);
+    return true;
+  }
+};
+
+/**
+ * ✅ CRITICAL FIX: Check if refresh token itself is expired
+ */
+const isRefreshTokenExpired = (refreshToken: string): boolean => {
+  try {
+    const decoded = jwtDecode<DecodedToken>(refreshToken);
+    const currentTime = Date.now() / 1000;
+    
+    const isExpired = decoded.exp < currentTime;
+    
+    if (isExpired) {
+      console.log('[Auth] ⚠️ Refresh token is expired');
+      clearAuthData();
+      console.log('[Auth] Expired at:', new Date(decoded.exp * 1000).toISOString());
+    }
+    
+    return isExpired;
+  } catch (error) {
+    console.error('[Auth] Error decoding refresh token:', error);
+    return true;
+  }
+};
+
+/**
+ * ✅ FIXED: Clear all auth data and force re-login
+ */
+const clearAuthData = async () => {
+  console.log('[Auth] 🧹 Clearing all authentication data');
+  await SecureStore.deleteItemAsync(TOKEN_KEY);
+  await SecureStore.deleteItemAsync(REFRESH_TOKEN_KEY);
+  await SecureStore.deleteItemAsync(SESSION_ID_KEY);
+  await SecureStore.deleteItemAsync(IS_ANONYMOUS_KEY);
+};
+
+/**
+ * ✅ FIXED: Refresh the access token using refresh token with proper error handling
+ */
+export const refreshAccessToken = async (): Promise<string | null> => {
+  try {
+    const refreshToken = await SecureStore.getItemAsync(REFRESH_TOKEN_KEY);
+    
+    if (!refreshToken) {
+      console.log('[Auth] ⚠️ No refresh token available');
+      return null;
+    }
+
+    // ✅ Check if refresh token itself is expired
+    if (isRefreshTokenExpired(refreshToken)) {
+      console.log('[Auth] ❌ Refresh token is expired - clearing auth data');
+      await clearAuthData();
+      return null;
+    }
+
+    console.log('[Auth] 🔄 Refreshing access token...');
+    
+    const response = await axios.post(`${BASE_URL}/refreshToken`, {
+      refreshToken,
+    }, {
+      timeout: 10000 // ✅ 10 second timeout
+    });
+
+    if (response.data.success && response.data.token) {
+      const newToken = response.data.token;
+      await SecureStore.setItemAsync(TOKEN_KEY, newToken);
+      
+      // ✅ CRITICAL: Store new refresh token (token rotation)
+      if (response.data.refreshToken) {
+        await SecureStore.setItemAsync(REFRESH_TOKEN_KEY, response.data.refreshToken);
+        console.log('[Auth] ✅ Access token AND refresh token updated');
+      } else {
+        console.log('[Auth] ✅ Access token refreshed successfully');
+      }
+      
+      return newToken;
+    }
+
+    console.log('[Auth] ❌ Token refresh failed - no token in response');
+    await clearAuthData();
+    return null;
+  } catch (error: any) {
+    console.error('[Auth] ❌ Failed to refresh token:', error.response?.data || error.message);
+    
+    // ✅ If refresh token is invalid/expired, clear everything
+    if (error.response?.status === 401 || error.response?.status === 403) {
+      console.log('[Auth] ❌ Refresh token invalid/expired - clearing auth data');
+      await clearAuthData();
+    }
+    
+    return null;
+  }
+};
+
+/**
+ * Get valid token - refreshes if expired
+ */
+export const getValidToken = async (): Promise<string | null> => {
+  try {
+    let token = await SecureStore.getItemAsync(TOKEN_KEY);
+    
+    if (!token) {
+      console.log('[Auth] No token found in storage');
+      return null;
+    }
+
+    // Check if token is expired or about to expire
+    if (isTokenExpired(token)) {
+      console.log('[Auth] Token expired, attempting refresh...');
+      token = await refreshAccessToken();
+      
+      if (!token) {
+        console.log('[Auth] Failed to refresh token');
+        return null;
+      }
+    }
+
+    return token;
+  } catch (error) {
+    console.error('[Auth] Error getting valid token:', error);
+    return null;
+  }
+};
+
+// ---------------------------------------------------------------------
+// Axios Interceptors Setup
+// ---------------------------------------------------------------------
+
+let isInterceptorSetup = false;
+let isRefreshing = false;
+let failedQueue: Array<{
+  resolve: (token: string | null) => void;
+  reject: (error: any) => void;
+}> = [];
+
+const processQueue = (error: any, token: string | null = null) => {
+  failedQueue.forEach(promise => {
+    if (error) {
+      promise.reject(error);
+    } else {
+      promise.resolve(token);
+    }
+  });
+  
+  failedQueue = [];
+};
+
+/**
+ * ✅ FIXED: Setup axios interceptors with proper error handling
+ */
+export const setupAxiosInterceptors = () => {
+  if (isInterceptorSetup) {
+    console.log('[Auth] Interceptors already setup, skipping...');
+    return;
+  }
+
+  console.log('[Auth] Setting up axios interceptors...');
+
+  // Request interceptor - add fresh token to all requests
+  axios.interceptors.request.use(
+    async (config: InternalAxiosRequestConfig) => {
+      // Skip token refresh for auth endpoints
+      if (config.url?.includes('/auth/login') || 
+          config.url?.includes('/auth/register') ||
+          config.url?.includes('/auth/refreshToken') ||
+          config.url?.includes('/auth/guest')) {
+        return config;
+      }
+
+      // Get valid token (will refresh if needed)
+      const token = await getValidToken();
+      
+      if (token && config.headers) {
+        config.headers.Authorization = `Bearer ${token}`;
+      }
+      
+      return config;
+    },
+    (error) => {
+      return Promise.reject(error);
+    }
+  );
+
+  // ✅ FIXED: Response interceptor with better error handling
+  axios.interceptors.response.use(
+    (response) => response,
+    async (error: AxiosError) => {
+      const originalRequest = error.config as InternalAxiosRequestConfig & { _retry?: boolean };
+
+      // ✅ Don't retry if request is to refresh endpoint
+      if (originalRequest.url?.includes('/auth/refreshToken')) {
+        console.log('[Auth] ❌ Refresh endpoint failed - clearing auth data');
+        await clearAuthData();
+        return Promise.reject(error);
+      }
+
+      // If error is not 401 or already retried, reject
+      if (error.response?.status !== 401 || originalRequest._retry) {
+        return Promise.reject(error);
+      }
+
+      // ✅ CRITICAL: Check if we should even attempt refresh
+      const refreshToken = await SecureStore.getItemAsync(REFRESH_TOKEN_KEY);
+      if (!refreshToken || isRefreshTokenExpired(refreshToken)) {
+        console.log('[Auth] ❌ Refresh token missing or expired - clearing auth data');
+        await clearAuthData();
+        return Promise.reject(error);
+      }
+
+      // If already refreshing, queue this request
+      if (isRefreshing) {
+        return new Promise((resolve, reject) => {
+          failedQueue.push({ resolve, reject });
+        })
+          .then(token => {
+            if (token && originalRequest.headers) {
+              originalRequest.headers.Authorization = `Bearer ${token}`;
+            }
+            return axios(originalRequest);
+          })
+          .catch(err => Promise.reject(err));
+      }
+
+      originalRequest._retry = true;
+      isRefreshing = true;
+
+      console.log('[Auth] 401 error detected, attempting token refresh...');
+      
+      try {
+        const newToken = await refreshAccessToken();
+
+        if (newToken) {
+          console.log('[Auth] Token refreshed, retrying original request');
+          processQueue(null, newToken);
+          
+          if (originalRequest.headers) {
+            originalRequest.headers.Authorization = `Bearer ${newToken}`;
+          }
+          
+          return axios(originalRequest);
+        } else {
+          console.log('[Auth] Token refresh failed, clearing auth data');
+          processQueue(new Error('Token refresh failed'), null);
+          await clearAuthData();
+          return Promise.reject(error);
+        }
+      } catch (refreshError) {
+        console.error('[Auth] Error during token refresh:', refreshError);
+        processQueue(refreshError, null);
+        await clearAuthData();
+        return Promise.reject(refreshError);
+      } finally {
+        isRefreshing = false;
+      }
+    }
+  );
+
+  isInterceptorSetup = true;
+  console.log('[Auth] ✅ Axios interceptors setup complete');
+};
+
+// ---------------------------------------------------------------------
+// Auth Functions
+// ---------------------------------------------------------------------
+
+/**
+ * Creates an anonymous guest session and stores the token.
+ */
+export async function createGuestSession(): Promise<AuthResponse | null> {
+  try {
+    const response = await axios.post<AuthResponse>(`${BASE_URL}/guest`);
+    
+    const { token, sessionId, isAnonymous } = response.data;
+    
+    await SecureStore.setItemAsync(TOKEN_KEY, token);
+    await SecureStore.setItemAsync(SESSION_ID_KEY, sessionId);
+    await SecureStore.setItemAsync(IS_ANONYMOUS_KEY, String(isAnonymous));
+
+    console.log('[Auth] Guest session created and token stored.');
+    return response.data;
+  } catch (error) {
+    console.error('[Auth] Error creating guest session:', error);
+    return null;
+  }
+}
+
+/**
+ * Converts an existing guest session to a full user account.
+ */
+export async function convertGuestToUser(sessionId: string, userData: UserData): Promise<AuthResponse | null> {
+  try {
+    const response = await axios.post<AuthResponse>(`${BASE_URL}/convert`, {
+      sessionId,
+      ...userData,
+    });
+
+    const { token, refreshToken } = response.data;
+    
+    await SecureStore.setItemAsync(TOKEN_KEY, token);
+    await SecureStore.setItemAsync(IS_ANONYMOUS_KEY, 'false');
+    
+    if (refreshToken) {
+      await SecureStore.setItemAsync(REFRESH_TOKEN_KEY, refreshToken);
+    }
+    
+    await SecureStore.deleteItemAsync(SESSION_ID_KEY);
+
+    console.log('[Auth] Guest session converted to full user.');
+    return response.data;
+  } catch (error) {
+    console.error('[Auth] Error converting guest session:', error);
+    return null;
+  }
+}
+
+/**
+ * Register a new user
+ */
+export async function registerUser(userData: UserData): Promise<AuthResponse | null> {
+  try {
+    const response = await axios.post<AuthResponse>(`${BASE_URL}/register`, userData);
+    
+    if (response.data.success) {
+      return { success: true, user: response.data, token: '' } as unknown as AuthResponse;
+    }
+    return null;
+  } catch (error) {
+    console.error('[Auth] Registration failed:', error);
+    throw error;
+  }
+}
+
+/**
+ * Login user or doctor
+ */
+export async function loginUser(
+  credentials: { email: string; password: string }, 
+  role: 'User' | 'Doctor'
+): Promise<AuthResponseData | null> {
+  try {
+    const endpoint = role === 'User' ? `${BASE_URL}/login` : `${BASE_URL}/doctor/login`;
+    
+    console.log(`[Auth] Logging in ${role}...`);
+    const response: AxiosResponse<AuthResponseData> = await axios.post(endpoint, credentials);
+    
+    if (response.data.token && response.data.user) {
+      // Store both access token and refresh token
+      await SecureStore.setItemAsync(TOKEN_KEY, response.data.token);
+      await SecureStore.setItemAsync(IS_ANONYMOUS_KEY, 'false');
+      
+      // Store refresh token if provided
+      if (response.data.refreshToken) {
+        await SecureStore.setItemAsync(REFRESH_TOKEN_KEY, response.data.refreshToken);
+        console.log('[Auth] Refresh token stored');
+      } else {
+        console.warn('[Auth] ⚠️ No refresh token received from server');
+      }
+      
+      // Clear any guest session data
+      await SecureStore.deleteItemAsync(SESSION_ID_KEY);
+      
+      console.log(`[Auth] ${role} logged in successfully, tokens stored.`);
+      return response.data;
+    }
+    return null;
+  } catch (error) {
+    console.error(`[Auth] ${role} Login failed:`, error);
+    throw error;
+  }
+}
+
+/**
+ * Register Expo push token
+ */
+export async function registerPushToken(token: string, authToken: string): Promise<boolean> {
+  try {
+    const response = await axios.post(
+      `${BASE_URL}/register-push-token`,
+      { token },
+      {
+        headers: {
+          Authorization: `Bearer ${authToken}`,
+        },
+      }
+    );
+    
+    if (response.data.success) {
+      console.log('[Auth] Push token registered successfully');
+      return true;
+    }
+    return false;
+  } catch (error) {
+    console.error('[Auth] Failed to register push token:', error);
+    return false;
+  }
+}
+
+/**
+ * Register raw FCM device token — separate from the Expo push token, used
+ * only to wake background/foreground call-ringing handlers.
+ */
+export async function registerFcmToken(token: string, authToken: string): Promise<boolean> {
+  try {
+    const response = await axios.post(
+      `${BASE_URL}/register-fcm-token`,
+      { token },
+      { headers: { Authorization: `Bearer ${authToken}` } }
+    );
+    return !!response.data.success;
+  } catch (error) {
+    console.error('[Auth] Failed to register FCM token:', error);
+    return false;
+  }
+}
+
+/**
+ * Remove raw FCM device token (on logout)
+ */
+export async function removeFcmToken(token: string, authToken: string): Promise<boolean> {
+  try {
+    const response = await axios.post(
+      `${BASE_URL}/remove-fcm-token`,
+      { token },
+      { headers: { Authorization: `Bearer ${authToken}` } }
+    );
+    return !!response.data.success;
+  } catch (error) {
+    console.error('[Auth] Failed to remove FCM token:', error);
+    return false;
+  }
+}
+
+/**
+ * Remove Expo push token (on logout)
+ */
+export async function removePushToken(token: string, authToken: string): Promise<boolean> {
+  try {
+    const response = await axios.post(
+      `${BASE_URL}/remove-push-token`,
+      { token },
+      {
+        headers: {
+          Authorization: `Bearer ${authToken}`,
+        },
+      }
+    );
+    
+    if (response.data.success) {
+      console.log('[Auth] Push token removed successfully');
+      return true;
+    }
+    return false;
+  } catch (error) {
+    console.error('[Auth] Failed to remove push token:', error);
+    return false;
+  }
+}
+
+/**
+ * Clears all authentication tokens upon logout.
+ */
+export async function logout() {
+  await clearAuthData();
+  console.log('[Auth] Logged out, all tokens cleared.');
+}

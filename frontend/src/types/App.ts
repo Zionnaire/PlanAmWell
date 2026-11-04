@@ -1,0 +1,128 @@
+import { IDoctor, IClinic } from "./backendType"
+
+import { NavigatorScreenParams } from '@react-navigation/native';
+import { AuthStackParamList } from '../types/Auth';
+
+export type AppStackParamList = {
+  AuthStack: NavigatorScreenParams<AuthStackParamList>; // ✅
+
+  AmWellChatModal: undefined;
+
+  ProductsScreen: { productId?: string };
+  ProductList: { category: string; fromChat?: boolean };
+
+  CheckoutScreen: undefined;
+  PaymentMethodScreen: { orderId: string; amount: number };
+  WebViewScreen: { url: string; orderId?: string; };
+  OrderDetailsScreen: { orderId: string };
+  ConfirmOrderScreen: { localOrder: any };
+  
+
+
+  HomeScreen: undefined;
+  ProfileScreen: undefined;
+
+  SettingsScreen: undefined;
+  NotificationsScreen: undefined;
+  HelpSupportScreen: undefined;
+  PrivacySettingsScreen: undefined;
+
+  DoctorScreen: { doctor: IDoctor };
+  AllDoctorScreen: undefined;
+
+  ArticleDetailScreen: { slug: string };
+  AllArticleScreen: undefined;
+
+  CommunityHubScreen: undefined;
+  CommunityEventDetailScreen: { eventId: string };
+  MyEventsScreen: undefined;
+
+  DoctorDashScreen: undefined;
+
+  BookAppointmentScreen: { doctor: IDoctor };
+
+  DoctorProfileScreen: { doctorId: string };
+
+  MyAppointments: undefined;
+  DoctorAvailability: undefined;
+  ConsultationHistory: undefined;
+  DoctorAppointment: undefined;
+
+  VideoCallScreen: {
+    appointmentId: string;
+    name?: string;
+    patientId?: string;
+    role?: string;
+    autoJoin?: boolean;
+    fromAppointmentList?: boolean;
+    fromNotification?: boolean;
+    userImage?: string;
+    doctorImage?: string;
+    callType?: 'audio' | 'video';
+  };
+
+  AllActivePartnerScreen: undefined;
+
+  IncomingCall: {
+    appointmentId: string;
+    callerName: string;
+    callerImage?: string;
+    callerType: 'Doctor' | 'Patient';
+    channelName: string;
+    conversationId?: string;
+    videoRequestId?: string;
+    callType?: 'audio' | 'video';
+    // Set when opened via a notification action button (iOS lock-screen
+    // Accept/Decline) — tells IncomingCallScreen to run that action
+    // immediately on mount instead of waiting for a tap inside the app.
+    autoAction?: 'accept' | 'decline';
+  };
+
+  ChatRoomScreen: {
+    appointmentId: string;
+    conversationId?: string;
+  };
+
+  PaymentScreen: {
+    doctor: IDoctor;
+    scheduledAt: string;       
+    reason: string;
+    notes?: string;
+    shareUserInfo: boolean;
+  };
+
+
+  PaymentStatusScreen: {
+    orderId: string;
+    
+  }
+  
+  ConversationsListScreen: undefined;
+
+   // Medical Records
+  MedicalRecordEditorScreen: {
+    appointmentId: string;
+    patientId: string;
+    patientName: string;
+    existingNoteId?: string;  // if editing an existing note
+  };
+  PatientRecordScreen: {
+    patientId: string;
+    patientName: string;
+    appointmentId: string;
+  };
+  MyMedicalRecordScreen: undefined;
+
+  DoctorPendingScreen: undefined;
+  DoctorOnboardingScreen: undefined;
+
+  PrivacyPolicyScreen: undefined;
+  TermsOfServiceScreen: undefined;
+  AboutScreen: undefined;
+
+  FindAClinicScreen: undefined;
+  ClinicDetailScreen: { clinic: IClinic };
+
+  MedicationRemindersScreen: undefined;
+  FamilyProfilesScreen: undefined;
+};
